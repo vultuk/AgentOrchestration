@@ -92,6 +92,24 @@ def test_audit_records_are_append_only_defensive_copies_with_digest_chain():
     assert store.verify_audit_chain()
 
 
+def test_audit_chain_verification_detects_tampering():
+    store = EventRetentionStore(clock=Clock())
+    store.append_audit_record(
+        "task.started",
+        "task-1",
+        {"status": "start"},
+    )
+    store.append_audit_record(
+        "task.completed",
+        "task-1",
+        {"status": "done"},
+    )
+
+    store._audit_records[0]["payload"]["status"] = "changed"
+
+    assert not store.verify_audit_chain()
+
+
 def test_operational_cleanup_does_not_delete_audit_records():
     clock = Clock()
     policy = EventRetentionPolicy(operational_seconds=60, audit_seconds=3_600)
