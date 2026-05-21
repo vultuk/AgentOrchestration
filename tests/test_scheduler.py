@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,61 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_workflow_blackout_defers_task_before_in_flight(self):
+        now = [1000.0]
+        scheduler = TaskScheduler(time_fn=lambda: now[0])
+        scheduler.set_workflow_blackout("workflow-a", [(990.0, 1050.0)])
+
+        task_id = scheduler.enqueue(
+            {"type": "run", "workflow_id": "workflow-a"}, priority=10
+        )
+
+        import asyncio
+        assert asyncio.run(scheduler.dequeue()) is None
+        assert task_id not in scheduler._in_flight
+        assert task_id in scheduler._scheduled
+        assert scheduler.metrics()["blackout_deferrals"] == 1
+        assert scheduler.audit_events() == [{
+            "event": "task_dispatch_deferred",
+            "reason": "workflow_blackout_window",
+            "task_id": task_id,
+            "workflow_id": "workflow-a",
+            "queue": "default",
+            "deferred_until": 1050.0,
+        }]
+
+        now[0] = 1051.0
+        task = asyncio.run(scheduler.dequeue())
+        assert task is not None
+        assert task["id"] == task_id
+        assert task["workflow_id"] == "workflow-a"
+        assert task_id in scheduler._in_flight
+
+    def test_blackout_deferral_does_not_block_eligible_work(self):
+        now = [2000.0]
+        scheduler = TaskScheduler(time_fn=lambda: now[0])
+        scheduler.set_workflow_blackout("workflow-a", [(1990.0, 2050.0)])
+
+        blocked_id = scheduler.enqueue(
+            {"type": "blocked", "workflow_id": "workflow-a"}, priority=10
+        )
+        ready_id = scheduler.enqueue(
+            {"type": "ready", "workflow_id": "workflow-b"}, priority=1
+        )
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        assert task is not None
+        assert task["id"] == ready_id
+        assert blocked_id in scheduler._scheduled
+        assert ready_id in scheduler._in_flight
+
+        now[0] = 2051.0
+        scheduler.complete(ready_id)
+        unblocked = asyncio.run(scheduler.dequeue())
+        assert unblocked is not None
+        assert unblocked["id"] == blocked_id
 
 # 2019-01-09T19:07:03 update
 

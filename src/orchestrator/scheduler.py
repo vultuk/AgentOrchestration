@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 
@@ -31,55 +30,156 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, time_fn: Optional[Callable[[], float]] = None):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._task_routing: Dict[str, Dict[str, Any]] = {}
+        self._workflow_blackouts: Dict[str, List[Tuple[float, float]]] = {}
+        self._audit_events: List[Dict[str, Any]] = []
+        self._metrics: Dict[str, int] = {"blackout_deferrals": 0}
         self._max_retries = 3
+        self._time = time_fn or time.time
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self, task: Dict, queue: str = "default", priority: int = 0
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
+        task["enqueued_at"] = self._time()
         task["retries"] = 0
+        self._task_routing[task_id] = {"queue": queue, "priority": priority}
 
-        if queue not in self._queues:
-            self._queues[queue] = PriorityQueue()
-        self._queues[queue].push(task, priority)
+        self._push_task(task, queue, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task.setdefault("retries", 0)
+        self._task_routing[task_id] = {"queue": queue, "priority": priority}
+        self._scheduled[task_id] = {
+            "task": task,
+            "queue": queue,
+            "priority": priority,
+            "run_at": self._time() + delay,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+    def set_workflow_blackout(
+        self, workflow_id: str, windows: List[Tuple[float, float]]
+    ) -> None:
+        normalized = []
+        for start, end in windows:
+            if end <= start:
+                raise ValueError("blackout window end must be after start")
+            normalized.append((float(start), float(end)))
+        self._workflow_blackouts[workflow_id] = normalized
 
-        if queue in self._queues and len(self._queues[queue]) > 0:
+    def clear_workflow_blackout(self, workflow_id: str) -> None:
+        self._workflow_blackouts.pop(workflow_id, None)
+
+    def audit_events(self) -> List[Dict[str, Any]]:
+        return list(self._audit_events)
+
+    def metrics(self) -> Dict[str, int]:
+        return dict(self._metrics)
+
+    async def dequeue(
+        self, queue: str = "default", timeout: float = 1.0
+    ) -> Optional[Dict]:
+        now = self._time()
+        self._promote_due_scheduled(now)
+
+        queue_size = len(self._queues.get(queue, []))
+        for _ in range(queue_size):
             task = self._queues[queue].pop()
-            if task:
-                self._in_flight[task["id"]] = task
-                return task
+            if not task:
+                continue
+
+            blackout_until = self._active_blackout_until(task, now)
+            if blackout_until is not None:
+                self._defer_for_blackout(task, queue, blackout_until)
+                continue
+
+            self._in_flight[task["id"]] = task
+            return task
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        completed = self._in_flight.pop(task_id, None) is not None
+        if completed:
+            self._task_routing.pop(task_id, None)
+        return completed
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
+        route = self._task_routing.pop(task_id, {})
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self.enqueue(task, queue, priority=route.get("priority", 0))
                 return True
         return False
+
+    def _push_task(self, task: Dict, queue: str, priority: int) -> None:
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        self._queues[queue].push(task, priority)
+
+    def _promote_due_scheduled(self, now: float) -> None:
+        expired = [
+            tid
+            for tid, record in self._scheduled.items()
+            if record["run_at"] <= now
+        ]
+        for task_id in expired:
+            record = self._scheduled.pop(task_id)
+            self._push_task(
+                record["task"], record["queue"], record["priority"]
+            )
+
+    def _active_blackout_until(
+        self, task: Dict, now: float
+    ) -> Optional[float]:
+        workflow_id = task.get("workflow_id")
+        if not workflow_id:
+            return None
+
+        active_ends = [
+            end
+            for start, end in self._workflow_blackouts.get(workflow_id, [])
+            if start <= now < end
+        ]
+        return min(active_ends) if active_ends else None
+
+    def _defer_for_blackout(
+        self, task: Dict, queue: str, blackout_until: float
+    ) -> None:
+        task_id = task["id"]
+        route = self._task_routing.get(task_id, {})
+        priority = route.get("priority", 0)
+        self._scheduled[task_id] = {
+            "task": task,
+            "queue": queue,
+            "priority": priority,
+            "run_at": blackout_until,
+        }
+        self._metrics["blackout_deferrals"] += 1
+        self._audit_events.append({
+            "event": "task_dispatch_deferred",
+            "reason": "workflow_blackout_window",
+            "task_id": task_id,
+            "workflow_id": task.get("workflow_id"),
+            "queue": queue,
+            "deferred_until": blackout_until,
+        })
 
 # 2019-04-25T08:37:12 update
 
