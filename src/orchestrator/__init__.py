@@ -3,8 +3,22 @@
 from .engine import OrchestrationEngine
 from .scheduler import TaskScheduler
 from .workflow import WorkflowManager
+from .data_lake import (
+    DataClassificationRegistry,
+    DataLakeIngestionPipeline,
+    DataLakePolicyError,
+    DataLakeWriteManifest,
+)
 
-__all__ = ["OrchestrationEngine", "TaskScheduler", "WorkflowManager"]
+__all__ = [
+    "OrchestrationEngine",
+    "TaskScheduler",
+    "WorkflowManager",
+    "DataClassificationRegistry",
+    "DataLakeIngestionPipeline",
+    "DataLakePolicyError",
+    "DataLakeWriteManifest",
+]
 
 # 2019-07-01T16:04:27 update
 
