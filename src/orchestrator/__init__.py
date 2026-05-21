@@ -2,9 +2,15 @@
 
 from .engine import OrchestrationEngine
 from .scheduler import TaskScheduler
+from .webhooks import WebhookRegistry
 from .workflow import WorkflowManager
 
-__all__ = ["OrchestrationEngine", "TaskScheduler", "WorkflowManager"]
+__all__ = [
+    "OrchestrationEngine",
+    "TaskScheduler",
+    "WebhookRegistry",
+    "WorkflowManager",
+]
 
 # 2019-07-01T16:04:27 update
 
