@@ -1,4 +1,7 @@
-import pytest
+import queue
+import threading
+import time
+
 from src.common.metrics import MetricsCollector
 
 
@@ -26,10 +29,28 @@ class TestMetricsCollector:
 
     def test_timer(self):
         self.metrics.start_timer("operation")
-        import time
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+
+    def test_stop_timer_records_duration_without_lock_reentry(self):
+        self.metrics.start_timer("operation")
+        results = queue.Queue()
+
+        def stop_timer():
+            results.put(self.metrics.stop_timer("operation"))
+
+        worker = threading.Thread(target=stop_timer, daemon=True)
+        worker.start()
+        worker.join(timeout=1)
+
+        assert not worker.is_alive()
+        duration = results.get_nowait()
+        assert duration >= 0
+
+        snapshot = self.metrics.snapshot()
+        assert snapshot["histograms"]["operation"]["count"] == 1
+        assert snapshot["histograms"]["operation"]["sum"] == duration
 
 # 2019-07-16T09:29:21 update
 
