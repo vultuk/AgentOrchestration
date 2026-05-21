@@ -4,8 +4,9 @@ import os
 import signal
 import subprocess
 import logging
+import threading
 from enum import Enum
-from typing import Dict, Optional
+from typing import BinaryIO, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +23,18 @@ class AgentRuntime:
     def __init__(self):
         self._processes: Dict[str, subprocess.Popen] = {}
         self._states: Dict[str, RuntimeState] = {}
+        self._drain_threads: Dict[str, List[threading.Thread]] = {}
 
-    def start(self, agent_id: str, command: list, env: Optional[Dict] = None) -> bool:
-        if agent_id in self._processes and self._processes[agent_id].poll() is None:
+    def start(
+        self,
+        agent_id: str,
+        command: list,
+        env: Optional[Dict] = None,
+    ) -> bool:
+        if (
+            agent_id in self._processes
+            and self._processes[agent_id].poll() is None
+        ):
             logger.warning(f"Agent {agent_id} is already running")
             return False
 
@@ -42,6 +52,7 @@ class AgentRuntime:
                 stderr=subprocess.PIPE,
             )
             self._processes[agent_id] = proc
+            self._start_pipe_drains(agent_id, proc)
             self._states[agent_id] = RuntimeState.RUNNING
             logger.info(f"Agent {agent_id} started (PID: {proc.pid})")
             return True
@@ -63,6 +74,7 @@ class AgentRuntime:
             proc.kill()
             proc.wait()
 
+        self._join_pipe_drains(agent_id)
         self._states[agent_id] = RuntimeState.STOPPED
         logger.info(f"Agent {agent_id} stopped")
         return True
@@ -70,12 +82,60 @@ class AgentRuntime:
     def get_state(self, agent_id: str) -> RuntimeState:
         proc = self._processes.get(agent_id)
         if proc and proc.poll() is not None:
-            self._states[agent_id] = RuntimeState.CRASHED
+            if self._states.get(agent_id) != RuntimeState.STOPPED:
+                self._states[agent_id] = RuntimeState.CRASHED
+            self._join_pipe_drains(agent_id, timeout=0.1)
         return self._states.get(agent_id, RuntimeState.STOPPED)
 
     def is_running(self, agent_id: str) -> bool:
         proc = self._processes.get(agent_id)
         return proc is not None and proc.poll() is None
+
+    def _start_pipe_drains(
+        self,
+        agent_id: str,
+        proc: subprocess.Popen,
+    ) -> None:
+        threads: List[threading.Thread] = []
+        streams = (("stdout", proc.stdout), ("stderr", proc.stderr))
+        for stream_name, pipe in streams:
+            if pipe is None:
+                continue
+            thread = threading.Thread(
+                target=self._drain_pipe,
+                args=(agent_id, stream_name, pipe),
+                name=f"agent-{agent_id}-{stream_name}-drain",
+                daemon=True,
+            )
+            thread.start()
+            threads.append(thread)
+        self._drain_threads[agent_id] = threads
+
+    def _drain_pipe(
+        self,
+        agent_id: str,
+        stream_name: str,
+        pipe: BinaryIO,
+    ) -> None:
+        try:
+            while pipe.read(65536):
+                pass
+        except Exception as exc:
+            logger.debug(
+                "Failed draining %s for agent %s: %s",
+                stream_name,
+                agent_id,
+                exc,
+            )
+        finally:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+    def _join_pipe_drains(self, agent_id: str, timeout: float = 1.0) -> None:
+        for thread in self._drain_threads.pop(agent_id, []):
+            thread.join(timeout=timeout)
 
 # 2019-01-11T10:56:26 update
 
