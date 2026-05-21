@@ -1,18 +1,116 @@
 """API middleware components."""
 
-import time
 import logging
-from typing import Callable
+import re
+import time
+from contextvars import ContextVar
+from email.message import Message
+from typing import Callable, Optional, Tuple
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+MAX_MULTIPART_BOUNDARY_LENGTH = 70
+UPLOAD_BOUNDARY_HEADER = "X-Upload-Boundary-Validation"
+_BOUNDARY_PATTERN = re.compile(r"^[A-Za-z0-9'()+_,./:=?-]+$")
+_current_upload_boundary: ContextVar[Optional[str]] = ContextVar(
+    "current_upload_boundary",
+    default=None,
+)
+
+
+def get_current_upload_boundary() -> Optional[str]:
+    """Return the multipart boundary validated for the current request."""
+    return _current_upload_boundary.get()
+
+
+def _content_type_parts(value: str) -> Tuple[str, Optional[str]]:
+    message = Message()
+    message["content-type"] = value
+    return (
+        message.get_content_type().lower(),
+        message.get_param("boundary", header="content-type"),
+    )
+
+
+def _has_malformed_parameters(value: str) -> bool:
+    for parameter in value.split(";")[1:]:
+        parameter = parameter.strip()
+        if not parameter or "=" not in parameter:
+            return True
+        name, _, _ = parameter.partition("=")
+        if not name.strip():
+            return True
+    return False
+
+
+def _invalid_boundary_reason(boundary: Optional[str]) -> Optional[str]:
+    if boundary is None:
+        return "missing"
+    if not boundary or boundary.strip() != boundary:
+        return "blank"
+    if len(boundary) > MAX_MULTIPART_BOUNDARY_LENGTH:
+        return "too_long"
+    if not _BOUNDARY_PATTERN.fullmatch(boundary):
+        return "malformed"
+    return None
+
+
+class UploadBoundaryMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        content_type = request.headers.get("content-type")
+        boundary = None
+        token = None
+
+        if content_type:
+            media_type, boundary = _content_type_parts(content_type)
+            if media_type.startswith("multipart/"):
+                reason = (
+                    "malformed"
+                    if _has_malformed_parameters(content_type)
+                    else _invalid_boundary_reason(boundary)
+                )
+                if reason:
+                    logger.warning(
+                        "Rejected multipart upload with %s boundary on %s",
+                        reason,
+                        request.url.path,
+                    )
+                    return Response(
+                        status_code=400,
+                        content="Invalid multipart boundary",
+                        media_type="text/plain",
+                        headers={UPLOAD_BOUNDARY_HEADER: "rejected"},
+                    )
+                token = _current_upload_boundary.set(boundary)
+
+        try:
+            response = await call_next(request)
+            if boundary is not None:
+                response.headers[UPLOAD_BOUNDARY_HEADER] = "accepted"
+            return response
+        finally:
+            if token is not None:
+                _current_upload_boundary.reset(token)
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +124,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +147,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
