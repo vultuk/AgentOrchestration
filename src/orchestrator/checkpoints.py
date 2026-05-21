@@ -3,10 +3,15 @@
 import copy
 import hashlib
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+
+from src.common.metrics import metrics
+
+logger = logging.getLogger(__name__)
 
 
 class CheckpointDigestMismatchError(ValueError):
@@ -31,6 +36,7 @@ class CheckpointStore:
 
     def __init__(self):
         self._records: Dict[str, CheckpointRecord] = {}
+        self._audit_events: List[Dict[str, Any]] = []
         self._lock = threading.RLock()
 
     @staticmethod
@@ -79,6 +85,12 @@ class CheckpointStore:
             current = self._records.get(key)
             if current:
                 if current.digest != digest:
+                    self._audit("rejected", key, "digest_mismatch")
+                    metrics.increment("checkpoint.write.digest_mismatch")
+                    logger.error(
+                        "checkpoint write rejected: digest_mismatch key=%s",
+                        self._fingerprint(key),
+                    )
                     raise CheckpointDigestMismatchError(
                         f"Checkpoint {key} already exists with digest "
                         f"{current.digest}; "
@@ -96,6 +108,8 @@ class CheckpointStore:
                     write_count=current.write_count + 1,
                 )
                 self._records[key] = record
+                self._audit("idempotent", key, "same_digest")
+                metrics.increment("checkpoint.write.idempotent")
                 return self._clone_record(record)
 
             record = CheckpointRecord(
@@ -109,6 +123,8 @@ class CheckpointStore:
                 updated_at=now,
             )
             self._records[key] = record
+            self._audit("created", key, "new_key")
+            metrics.increment("checkpoint.write.created")
             return self._clone_record(record)
 
     def get(
@@ -152,3 +168,21 @@ class CheckpointStore:
                 self._clone_record(record)
                 for record in self._records.values()
             ]
+
+    def list_audit_events(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(event) for event in self._audit_events]
+
+    def _audit(self, decision: str, key: str, reason: str) -> None:
+        self._audit_events.append(
+            {
+                "decision": decision,
+                "reason": reason,
+                "checkpoint": self._fingerprint(key),
+                "timestamp": time.time(),
+            },
+        )
+
+    @staticmethod
+    def _fingerprint(key: str) -> str:
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
