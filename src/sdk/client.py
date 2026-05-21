@@ -18,7 +18,7 @@ class OrchestratorClient:
         self._session = None
 
     def _build_url(self, path: str) -> str:
-        normalized_path = path if path.startswith("/") else f"/{path}"
+        normalized_path = f"/{path.lstrip('/')}"
         return f"{self.base_url}/api/v2{normalized_path}"
 
     def _request(self, method: str, path: str, data: Dict = None) -> Dict:

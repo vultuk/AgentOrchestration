@@ -69,3 +69,59 @@ def test_request_normalizes_paths_without_leading_slash(monkeypatch):
         requests[0].full_url
         == "https://example.test/api/v2/agents"
     )
+
+
+def test_request_normalizes_repeated_leading_path_slashes(monkeypatch):
+    requests = []
+
+    def fake_urlopen(req):
+        requests.append(req)
+        return _FakeResponse()
+
+    monkeypatch.setattr("src.sdk.client.urlopen", fake_urlopen)
+    client = OrchestratorClient(
+        base_url="https://example.test/",
+        api_key="token",
+    )
+
+    response = client._request("GET", "///agents")
+
+    assert response == {"ok": True}
+    assert (
+        requests[0].full_url
+        == "https://example.test/api/v2/agents"
+    )
+
+
+def test_request_preserves_query_strings_after_path_normalization(monkeypatch):
+    requests = []
+
+    def fake_urlopen(req):
+        requests.append(req)
+        return _FakeResponse()
+
+    monkeypatch.setattr("src.sdk.client.urlopen", fake_urlopen)
+    client = OrchestratorClient(
+        base_url="https://example.test/",
+        api_key="token",
+    )
+
+    response = client._request("GET", "agents?status=running")
+
+    assert response == {"ok": True}
+    assert (
+        requests[0].full_url
+        == "https://example.test/api/v2/agents?status=running"
+    )
+
+
+def test_environment_base_url_is_normalized(monkeypatch):
+    monkeypatch.setenv("AO_API_URL", "https://env.example.test///")
+
+    client = OrchestratorClient(api_key="token")
+
+    assert client.base_url == "https://env.example.test"
+    assert (
+        client._build_url("/agents")
+        == "https://env.example.test/api/v2/agents"
+    )
