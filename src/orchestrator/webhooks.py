@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from uuid import uuid4
@@ -158,7 +159,7 @@ class WebhookRegistry:
             record.attempts += 1
             try:
                 if deliver:
-                    sent = deliver(endpoint.url, delivery_payload)
+                    sent = deliver(endpoint.url, deepcopy(delivery_payload))
                 else:
                     sent = True
             except Exception as exc:
@@ -195,7 +196,7 @@ class WebhookRegistry:
                 "callback_id": callback_id,
                 "payload": self._sanitize(payload),
             }
-        return self._callbacks[key]
+        return deepcopy(self._callbacks[key])
 
     def shape_public_event(
         self,
@@ -210,7 +211,22 @@ class WebhookRegistry:
         }
 
     def delivery_records(self) -> List[DeliveryRecord]:
-        return list(self._deliveries.values())
+        return [
+            DeliveryRecord(
+                delivery_id=record.delivery_id,
+                endpoint_id=record.endpoint_id,
+                endpoint_version=record.endpoint_version,
+                workspace_id=record.workspace_id,
+                event_id=record.event_id,
+                event_type=record.event_type,
+                url=record.url,
+                status=record.status,
+                attempts=record.attempts,
+                payload=deepcopy(record.payload),
+                error=record.error,
+            )
+            for record in self._deliveries.values()
+        ]
 
     def _new_delivery_record(
         self,

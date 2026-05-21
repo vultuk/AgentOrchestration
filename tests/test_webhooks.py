@@ -175,6 +175,31 @@ def test_retry_behavior_is_idempotent_after_success_and_retries_failures():
     assert "changed" not in str(first.payload)
 
 
+def test_transport_mutation_cannot_poison_delivery_record():
+    registry = WebhookRegistry()
+    registry.register_endpoint("workspace-a", "https://hooks.example.com/a")
+
+    def mutate_transport(url, payload):
+        payload["payload"]["runId"] = "transport-injected"
+        payload["payload"]["result"]["secretValue"] = "transport-secret"
+        return True
+
+    record = registry.deliver_event(
+        "workspace-a",
+        "task.completed",
+        "event-1",
+        event_payload(),
+        deliver=mutate_transport,
+    )[0]
+    records = registry.delivery_records()
+    records[0].payload["payload"]["runId"] = "external-injected"
+
+    assert "transport-injected" not in str(record.payload)
+    assert "transport-secret" not in str(record.payload)
+    latest_record = registry.delivery_records()[0]
+    assert "external-injected" not in str(latest_record.payload)
+
+
 def test_rotated_endpoint_uses_new_delivery_scope_for_same_event():
     registry = WebhookRegistry()
     endpoint_id = registry.register_endpoint(
@@ -236,7 +261,16 @@ def test_callbacks_are_workspace_scoped_idempotent_and_sanitized():
         {"status": "changed", "run_id": "leak"},
     )
 
-    assert first is second
+    assert first == second
     assert first["status"] == "accepted"
     assert "run-internal" not in str(first["payload"])
     assert "leak" not in str(second["payload"])
+
+    first["payload"]["runId"] = "external-injected"
+    stored = registry.record_callback(
+        "workspace-a",
+        endpoint_id,
+        "callback-1",
+        event_payload(),
+    )
+    assert "external-injected" not in str(stored["payload"])
