@@ -23,6 +23,8 @@ jobs:
         uses: astral-sh/setup-uv@v3
       - name: Install dependencies
         run: uv sync
+      - name: Verify generated dependency manifests
+        run: make verify-dependency-manifests
       - name: Run tests
         run: uv run pytest --cov=src tests/
       - name: Lint

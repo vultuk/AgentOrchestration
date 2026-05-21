@@ -1,4 +1,4 @@
-.PHONY: install test lint clean build run
+.PHONY: install test lint clean build run verify-dependency-manifests
 
 install:
 	uv sync
@@ -9,6 +9,14 @@ test:
 lint:
 	flake8 src/ tests/
 	mypy src/ --ignore-missing-imports
+
+verify-dependency-manifests:
+	@echo "Checking generated dependency manifest; regenerate with: uv lock"
+	@if [ -n "$$(git status --porcelain -- uv.lock)" ]; then \
+		echo "::error file=uv.lock::Generated dependency manifest is stale. Run 'uv lock' and commit uv.lock."; \
+		git status --short -- uv.lock; \
+		exit 1; \
+	fi
 
 clean:
 	rm -rf build/ dist/ *.egg-info/ __pycache__/
