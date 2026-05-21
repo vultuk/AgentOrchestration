@@ -1,8 +1,11 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 class StepStatus(Enum):
@@ -14,7 +17,13 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -26,13 +35,26 @@ class WorkflowStep:
 
 
 class Workflow:
-    def __init__(self, name: str, description: str = ""):
+    def __init__(
+        self,
+        name: str,
+        description: str = "",
+        parent_id: Optional[str] = None,
+        parent_attempt: Optional[int] = None,
+        parent_revision: Optional[int] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.description = description
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.attempt = 0
+        self.revision = 0
+        self.parent_id = parent_id
+        self.parent_attempt = parent_attempt
+        self.parent_revision = parent_revision
+        self.audit_log: List[Dict[str, Any]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -41,6 +63,29 @@ class Workflow:
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
+
+    def transition(self, status: StepStatus, reason: str) -> None:
+        self.status = status
+        self.revision += 1
+        self.record_audit(
+            "workflow_transition",
+            {
+                "status": status.value,
+                "reason": reason,
+                "attempt": self.attempt,
+                "revision": self.revision,
+            },
+        )
+
+    def record_audit(self, event: str, details: Dict[str, Any]) -> None:
+        record = {
+            "event": event,
+            "workflow_id": self.id,
+            "attempt": self.attempt,
+            "revision": self.revision,
+        }
+        record.update(details)
+        self.audit_log.append(record)
 
 
 class WorkflowManager:
@@ -61,12 +106,88 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
+    def start_subworkflow(
+        self,
+        parent_workflow_id: str,
+        name: str,
+        description: str = "",
+        expected_parent_attempt: Optional[int] = None,
+        expected_parent_revision: Optional[int] = None,
+    ) -> Optional[Workflow]:
+        parent = self._workflows.get(parent_workflow_id)
+        if not parent:
+            logger.warning(
+                "Rejected subworkflow start for missing parent workflow",
+            )
+            return None
+
+        expected_attempt = (
+            parent.attempt
+            if expected_parent_attempt is None
+            else expected_parent_attempt
+        )
+        expected_revision = (
+            parent.revision
+            if expected_parent_revision is None
+            else expected_parent_revision
+        )
+        rejection_reasons = []
+        if parent.attempt != expected_attempt:
+            rejection_reasons.append("parent_attempt_changed")
+        if parent.revision != expected_revision:
+            rejection_reasons.append("parent_revision_changed")
+        if parent.status != StepStatus.RUNNING:
+            rejection_reasons.append("parent_not_running")
+
+        if rejection_reasons:
+            details = {
+                "reason": ",".join(rejection_reasons),
+                "parent_status": parent.status.value,
+                "expected_parent_attempt": expected_attempt,
+                "actual_parent_attempt": parent.attempt,
+                "expected_parent_revision": expected_revision,
+                "actual_parent_revision": parent.revision,
+            }
+            parent.record_audit("subworkflow_start_rejected", details)
+            logger.info(
+                "Rejected subworkflow start for parent %s: %s",
+                parent.id,
+                details["reason"],
+            )
+            return None
+
+        child = Workflow(
+            name,
+            description,
+            parent_id=parent.id,
+            parent_attempt=expected_attempt,
+            parent_revision=expected_revision,
+        )
+        self._workflows[child.id] = child
+        parent.revision += 1
+        parent.record_audit(
+            "subworkflow_started",
+            {
+                "child_workflow_id": child.id,
+                "parent_status": parent.status.value,
+                "parent_attempt": expected_attempt,
+                "parent_revision": expected_revision,
+            },
+        )
+        logger.info(
+            "Started subworkflow %s for parent %s",
+            child.id,
+            parent.id,
+        )
+        return child
+
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
 
-        workflow.status = StepStatus.RUNNING
+        workflow.attempt += 1
+        workflow.transition(StepStatus.RUNNING, "workflow_execution_started")
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
             try:
@@ -76,10 +197,13 @@ class WorkflowManager:
             except Exception as e:
                 step.error = str(e)
                 step.status = StepStatus.FAILED
-                workflow.status = StepStatus.FAILED
+                workflow.transition(StepStatus.FAILED, "workflow_step_failed")
                 return False
 
-        workflow.status = StepStatus.COMPLETED
+        workflow.transition(
+            StepStatus.COMPLETED,
+            "workflow_execution_completed",
+        )
         return True
 
 # 2019-03-27T19:58:07 update
