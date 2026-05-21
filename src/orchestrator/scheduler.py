@@ -1,10 +1,40 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
+import hashlib
 import heapq
 import time
-from typing import Any, Dict, Optional
+from enum import Enum
+from threading import RLock
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+
+class TaskState(str, Enum):
+    QUEUED = "queued"
+    SCHEDULED = "scheduled"
+    IN_FLIGHT = "in_flight"
+    COMPLETED = "completed"
+    DEAD_LETTERED = "dead_lettered"
+    CANCELLED = "cancelled"
+
+
+TERMINAL_STATES = {
+    TaskState.COMPLETED,
+    TaskState.DEAD_LETTERED,
+    TaskState.CANCELLED,
+}
+
+
+VALID_TRANSITIONS = {
+    TaskState.QUEUED: {TaskState.IN_FLIGHT, TaskState.CANCELLED},
+    TaskState.SCHEDULED: {TaskState.QUEUED, TaskState.CANCELLED},
+    TaskState.IN_FLIGHT: {
+        TaskState.SCHEDULED,
+        TaskState.COMPLETED,
+        TaskState.DEAD_LETTERED,
+        TaskState.CANCELLED,
+    },
+}
 
 
 class PriorityQueue:
@@ -31,55 +61,273 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        max_retries: int = 3,
+        retry_delay: float = 0.0,
+        clock: Optional[Callable[[], float]] = None,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
-        self._max_retries = 3
+        self._states: Dict[str, TaskState] = {}
+        self._attempts: Dict[str, int] = {}
+        self._dead_letters: Dict[str, Dict[str, Any]] = {}
+        self._audit_records: List[Dict[str, str]] = []
+        self._lock = RLock()
+        self._max_retries = max(0, max_retries)
+        self._retry_delay = max(0.0, retry_delay)
+        self._clock = clock or time.time
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        with self._lock:
+            task_id = str(uuid4())
+            task["id"] = task_id
+            task["enqueued_at"] = self._clock()
+            task["retries"] = 0
+            task["attempt"] = 0
+            self._attempts[task_id] = 0
+            self._push_current_attempt(task, queue, priority)
+            return task_id
 
-        if queue not in self._queues:
-            self._queues[queue] = PriorityQueue()
-        self._queues[queue].push(task, priority)
-        return task_id
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        with self._lock:
+            task_id = str(uuid4())
+            task["id"] = task_id
+            task["queue"] = queue
+            task["priority"] = priority
+            task["retries"] = 0
+            task["attempt"] = 0
+            task["scheduled_for"] = self._clock() + max(0.0, delay)
+            self._attempts[task_id] = 0
+            self._transition(task_id, TaskState.SCHEDULED)
+            self._scheduled[task_id] = task
+            return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
-        return task_id
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        del timeout
+        with self._lock:
+            self._promote_ready_tasks()
+            if queue not in self._queues:
+                return None
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
-
-        if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
-            if task:
-                self._in_flight[task["id"]] = task
-                return task
-        return None
+            while task:
+                task_id = task.get("id")
+                if self._is_current_attempt(task, TaskState.QUEUED):
+                    self._transition(task_id, TaskState.IN_FLIGHT)
+                    task["started_at"] = self._clock()
+                    self._in_flight[task_id] = task
+                    return task
+                task = self._queues[queue].pop()
+            return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        with self._lock:
+            task = self._in_flight.get(task_id)
+            if not task:
+                return False
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+            self._in_flight.pop(task_id, None)
+            if not self._transition(task_id, TaskState.COMPLETED):
+                return False
+            task["completed_at"] = self._clock()
+            return True
+
+    def fail(
+        self,
+        task_id: str,
+        queue: Optional[str] = None,
+        reason: str = "handler_failed",
+        retryable: bool = True,
+    ) -> bool:
+        with self._lock:
+            task = self._in_flight.get(task_id)
+            if not task:
+                return self._handle_duplicate_ack(task_id)
+
+            next_retry = int(task.get("retries", 0)) + 1
+            task["retries"] = next_retry
+
+            if retryable and next_retry < self._max_retries:
+                self._in_flight.pop(task_id, None)
+                self._attempts[task_id] = self._attempts.get(task_id, 0) + 1
+                task["attempt"] = self._attempts[task_id]
+                task["queue"] = queue or task.get("queue", "default")
+                task["scheduled_for"] = self._clock() + self._retry_delay
+                self._transition(task_id, TaskState.SCHEDULED)
+                self._scheduled[task_id] = task
+                self._audit(
+                    "ack_retry_scheduled",
+                    task_id,
+                    "retry_budget_available",
+                )
                 return True
+
+            return self._write_dead_letter(task, reason)
+
+    def cancel(self, task_id: str) -> bool:
+        with self._lock:
+            if (
+                task_id not in self._states
+                or self._states[task_id] in TERMINAL_STATES
+            ):
+                return False
+
+            self._in_flight.pop(task_id, None)
+            self._scheduled.pop(task_id, None)
+            return self._transition(task_id, TaskState.CANCELLED)
+
+    def get_state(self, task_id: str) -> Optional[TaskState]:
+        with self._lock:
+            return self._states.get(task_id)
+
+    def dead_letters(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(record) for record in self._dead_letters.values()]
+
+    def audit_records(self) -> List[Dict[str, str]]:
+        with self._lock:
+            return [dict(record) for record in self._audit_records]
+
+    def _push_current_attempt(
+        self,
+        task: Dict,
+        queue: str,
+        priority: int,
+    ) -> None:
+        task_id = task["id"]
+        task["queue"] = queue
+        task["priority"] = priority
+        task["attempt"] = self._attempts[task_id]
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        self._transition(task_id, TaskState.QUEUED)
+        self._queues[queue].push(task, priority)
+
+    def _promote_ready_tasks(self) -> None:
+        now = self._clock()
+        ready = [
+            task_id
+            for task_id, task in self._scheduled.items()
+            if task.get("scheduled_for", 0) <= now
+        ]
+        for task_id in ready:
+            task = self._scheduled.pop(task_id)
+            if not self._is_current_attempt(task, TaskState.SCHEDULED):
+                continue
+            self._push_current_attempt(
+                task,
+                task.get("queue", "default"),
+                int(task.get("priority", 0)),
+            )
+
+    def _is_current_attempt(self, task: Dict, state: TaskState) -> bool:
+        task_id = task.get("id")
+        return (
+            task_id in self._states
+            and self._states.get(task_id) == state
+            and task.get("attempt", 0) == self._attempts.get(task_id, 0)
+        )
+
+    def _handle_duplicate_ack(self, task_id: str) -> bool:
+        state = self._states.get(task_id)
+        if task_id in self._dead_letters:
+            self._audit(
+                "dead_letter_duplicate",
+                task_id,
+                "already_dead_lettered",
+            )
+            return True
+        if state == TaskState.SCHEDULED:
+            self._audit(
+                "ack_retry_deferred",
+                task_id,
+                "scheduled_retry_pending",
+            )
+            return True
+        if state == TaskState.QUEUED:
+            self._audit("ack_retry_deferred", task_id, "retry_already_queued")
+            return True
+        self._audit("ack_retry_rejected", task_id, "invalid_or_unknown_task")
         return False
+
+    def _write_dead_letter(self, task: Dict, reason: str) -> bool:
+        task_id = task["id"]
+        if task_id in self._dead_letters:
+            self._in_flight.pop(task_id, None)
+            self._audit(
+                "dead_letter_duplicate",
+                task_id,
+                "already_dead_lettered",
+            )
+            return True
+
+        record = {
+            "task_ref": self._task_ref(task_id),
+            "type": str(task.get("type", "")),
+            "retries": int(task.get("retries", 0)),
+            "attempt": int(task.get("attempt", 0)),
+            "reason": self._safe_reason(reason),
+            "dead_lettered_at": self._clock(),
+        }
+        self._dead_letters[task_id] = record
+        self._in_flight.pop(task_id, None)
+        if not self._transition(task_id, TaskState.DEAD_LETTERED):
+            return False
+        self._audit("dead_letter_written", task_id, "retry_budget_exhausted")
+        return True
+
+    def _audit(self, event: str, task_id: str, decision: str) -> None:
+        self._audit_records.append({
+            "event": event,
+            "task_ref": self._task_ref(task_id),
+            "decision": decision,
+        })
+
+    def _transition(self, task_id: str, next_state: TaskState) -> bool:
+        current_state = self._states.get(task_id)
+        if current_state in TERMINAL_STATES:
+            return False
+        if (
+            current_state is not None
+            and next_state not in VALID_TRANSITIONS.get(current_state, set())
+        ):
+            return False
+        self._states[task_id] = next_state
+        return True
+
+    @staticmethod
+    def _task_ref(task_id: str) -> str:
+        return hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:12]
+
+    @staticmethod
+    def _safe_reason(reason: str) -> str:
+        normalized = str(reason).lower()
+        if "timeout" in normalized:
+            return "timeout"
+        if "cancel" in normalized:
+            return "cancelled"
+        if "worker" in normalized:
+            return "worker_error"
+        if "handler" in normalized:
+            return "handler_failed"
+        return "unspecified"
 
 # 2019-04-25T08:37:12 update
 

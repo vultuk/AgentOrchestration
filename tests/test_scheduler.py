@@ -1,5 +1,6 @@
-import pytest
-from src.orchestrator.scheduler import TaskScheduler
+import asyncio
+
+from src.orchestrator.scheduler import TaskScheduler, TaskState
 
 
 class TestTaskScheduler:
@@ -12,7 +13,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +20,99 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
+        assert self.scheduler.get_state(task["id"]) == TaskState.COMPLETED
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+        assert self.scheduler.get_state(task["id"]) == TaskState.SCHEDULED
+
+    def test_scheduled_task_preserves_identity_when_ready(self):
+        now = [100.0]
+        scheduler = TaskScheduler(clock=lambda: now[0])
+
+        task_id = scheduler.schedule({"type": "delayed"}, delay=5)
+        assert asyncio.run(scheduler.dequeue()) is None
+
+        now[0] = 105.1
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task["id"] == task_id
+        assert task["type"] == "delayed"
+        assert scheduler.get_state(task_id) == TaskState.IN_FLIGHT
+
+    def test_duplicate_ack_retry_is_deferred_without_state_change(self):
+        now = [200.0]
+        scheduler = TaskScheduler(
+            max_retries=3,
+            retry_delay=10,
+            clock=lambda: now[0],
+        )
+
+        task_id = scheduler.enqueue({
+            "type": "ack-retry",
+            "payload": {"token": "secret-value"},
+        })
+        task = asyncio.run(scheduler.dequeue())
+        assert task["id"] == task_id
+
+        assert scheduler.fail(task_id, reason="worker_error")
+        assert scheduler.get_state(task_id) == TaskState.SCHEDULED
+        assert scheduler.fail(task_id, reason="worker_error")
+
+        scheduled = scheduler._scheduled[task_id]
+        assert scheduled["retries"] == 1
+        assert scheduled["attempt"] == 1
+        assert scheduler.get_state(task_id) == TaskState.SCHEDULED
+
+        audits = scheduler.audit_records()
+        assert audits[-1]["event"] == "ack_retry_deferred"
+        assert all("secret-value" not in str(record) for record in audits)
+
+        now[0] = scheduled["scheduled_for"] + 0.1
+        retry = asyncio.run(scheduler.dequeue())
+        assert retry["id"] == task_id
+        assert retry["retries"] == 1
+
+    def test_dead_letter_write_is_idempotent_and_sanitized(self):
+        scheduler = TaskScheduler(max_retries=1)
+
+        task_id = scheduler.enqueue({
+            "type": "billing",
+            "payload": {"token": "do-not-log"},
+        })
+        task = asyncio.run(scheduler.dequeue())
+
+        assert scheduler.fail(
+            task["id"],
+            reason="worker_error token=do-not-log",
+        )
+        assert scheduler.get_state(task_id) == TaskState.DEAD_LETTERED
+        assert scheduler.fail(task_id, reason="worker_error token=do-not-log")
+
+        dead_letters = scheduler.dead_letters()
+        assert len(dead_letters) == 1
+        assert dead_letters[0]["type"] == "billing"
+        assert dead_letters[0]["retries"] == 1
+        assert dead_letters[0]["reason"] == "worker_error"
+        assert task_id not in str(dead_letters)
+        assert "do-not-log" not in str(dead_letters)
+
+        audits = scheduler.audit_records()
+        assert [record["event"] for record in audits[-2:]] == [
+            "dead_letter_written",
+            "dead_letter_duplicate",
+        ]
+        assert task_id not in str(audits)
+        assert "do-not-log" not in str(audits)
 
 # 2019-01-09T19:07:03 update
 
