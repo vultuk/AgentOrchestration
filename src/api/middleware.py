@@ -1,8 +1,11 @@
 """API middleware components."""
 
+import json
+import os
 import time
 import logging
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Optional, Set, Tuple, Union
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -10,13 +13,190 @@ from starlette.responses import Response
 logger = logging.getLogger(__name__)
 
 
+class AuthError(Exception):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
+@dataclass(frozen=True)
+class AuthPrincipal:
+    subject: str
+    workspace_role: str
+    scopes: frozenset[str]
+
+
+@dataclass(frozen=True)
+class TokenRecord:
+    subject: str
+    workspace_role: str
+    scopes: frozenset[str]
+    revoked: bool = False
+    expires_at: Optional[float] = None
+
+
+class TokenAuthorizer:
+    def __init__(self, tokens: Optional[Union[dict, list]] = None):
+        self._tokens = self._normalize_tokens(tokens or {})
+
+    @classmethod
+    def from_config(cls, config: Optional[dict] = None) -> "TokenAuthorizer":
+        config = config or {}
+        tokens = config.get("auth_tokens")
+        if tokens is None:
+            env_tokens = os.getenv("AO_AUTH_TOKENS")
+            if env_tokens:
+                tokens = json.loads(env_tokens)
+        return cls(tokens)
+
+    def authorize_request(
+        self,
+        authorization: str,
+        session_token: Optional[str],
+        required_scope: str,
+        allowed_roles: Set[str],
+    ) -> AuthPrincipal:
+        token = self._extract_request_token(authorization, session_token)
+        record = self._tokens.get(token)
+        if record is None:
+            raise AuthError(401, "Unauthorized")
+        is_expired = (
+            record.expires_at is not None
+            and record.expires_at <= time.time()
+        )
+        if record.revoked or is_expired:
+            raise AuthError(401, "Unauthorized")
+        if required_scope not in record.scopes:
+            raise AuthError(403, "Forbidden")
+        if record.workspace_role not in allowed_roles:
+            raise AuthError(403, "Forbidden")
+        return AuthPrincipal(
+            record.subject,
+            record.workspace_role,
+            record.scopes,
+        )
+
+    @classmethod
+    def _extract_request_token(
+        cls,
+        authorization: str,
+        session_token: Optional[str],
+    ) -> str:
+        if authorization:
+            return cls._extract_bearer_token(authorization)
+        if session_token:
+            return cls._extract_session_token(session_token)
+        raise AuthError(401, "Unauthorized")
+
+    @classmethod
+    def _extract_bearer_token(cls, authorization: str) -> str:
+        prefix = "Bearer "
+        if not authorization.startswith(prefix):
+            raise AuthError(401, "Unauthorized")
+        token = authorization[len(prefix):].strip()
+        return cls._validate_token_value(token)
+
+    @classmethod
+    def _extract_session_token(cls, session_token: str) -> str:
+        return cls._validate_token_value(session_token.strip())
+
+    @classmethod
+    def _validate_token_value(cls, token: str) -> str:
+        if not token or any(char.isspace() for char in token):
+            raise AuthError(401, "Unauthorized")
+        return token
+
+    @classmethod
+    def _normalize_tokens(
+        cls,
+        tokens: Union[dict, list],
+    ) -> dict[str, TokenRecord]:
+        if isinstance(tokens, list):
+            token_items = ((entry["token"], entry) for entry in tokens)
+        else:
+            token_items = tokens.items()
+
+        normalized = {}
+        for token, raw_record in token_items:
+            if not token:
+                continue
+            if raw_record is None:
+                raw_record = {}
+            scopes = frozenset(
+                raw_record.get("scopes", ["agents:read", "agents:write"])
+            )
+            normalized[str(token)] = TokenRecord(
+                subject=raw_record.get("subject", "api-client"),
+                workspace_role=raw_record.get("workspace_role", "admin"),
+                scopes=scopes,
+                revoked=bool(raw_record.get("revoked", False)),
+                expires_at=raw_record.get("expires_at"),
+            )
+        return normalized
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
+    PUBLIC_API_PATHS = {"/api/v2/auth/token"}
+    READ_METHODS = {"GET", "HEAD"}
+
+    def __init__(
+        self,
+        app,
+        authorizer: Optional[TokenAuthorizer] = None,
+        session_cookie_name: str = "ao_session",
+    ):
+        super().__init__(app)
+        self.authorizer = authorizer or TokenAuthorizer()
+        self.session_cookie_name = session_cookie_name
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        auth_requirement = self._auth_requirement(request)
+        if auth_requirement is not None:
+            required_scope, allowed_roles = auth_requirement
+            try:
+                request.state.auth = self.authorizer.authorize_request(
+                    request.headers.get("Authorization", ""),
+                    request.cookies.get(self.session_cookie_name),
+                    required_scope,
+                    allowed_roles,
+                )
+            except AuthError as exc:
+                return Response(
+                    status_code=exc.status_code,
+                    content=exc.message,
+                )
         return await call_next(request)
+
+    def _auth_requirement(
+        self,
+        request: Request,
+    ) -> Optional[Tuple[str, Set[str]]]:
+        path = self._canonical_api_path(request.url.path)
+        if not self._is_protected_api_path(path):
+            return None
+        if path in self.PUBLIC_API_PATHS:
+            return None
+        if request.method in self.READ_METHODS:
+            return "agents:read", {"admin", "operator", "viewer"}
+        return "agents:write", {"admin", "operator"}
+
+    @staticmethod
+    def _canonical_api_path(path: str) -> str:
+        normalized = "/" + path.lstrip("/")
+        while "//" in normalized:
+            normalized = normalized.replace("//", "/")
+        if len(normalized) > 1:
+            normalized = normalized.rstrip("/")
+        return normalized
+
+    @staticmethod
+    def _is_protected_api_path(path: str) -> bool:
+        return path == "/api/v2" or path.startswith("/api/v2/")
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -26,14 +206,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +229,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            f"{request.method} {request.url.path} "
+            f"{response.status_code} {duration:.3f}s"
+        )
         return response
 
 # 2019-03-01T18:35:19 update
