@@ -80,6 +80,15 @@ def test_openapi_schema_rejects_stale_revoked_and_unknown_tokens():
     ).status_code == 401
 
 
+def test_openapi_schema_fails_closed_without_token_store():
+    client = TestClient(create_app())
+
+    assert client.get(
+        "/api/openapi.json",
+        headers=bearer("docs-admin"),
+    ).status_code == 401
+
+
 def test_openapi_schema_rejects_insufficient_scope_and_workspace_role():
     client = make_client()
 

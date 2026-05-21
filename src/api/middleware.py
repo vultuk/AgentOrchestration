@@ -55,6 +55,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         token_store = getattr(request.app.state, "auth_tokens", None)
         if token_store is None:
+            if required_scope:
+                return 401, "Unauthorized"
             return None
 
         principal = token_store.get(token)
