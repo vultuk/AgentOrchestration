@@ -21,6 +21,7 @@ DEFAULT_TIMEOUT_SECONDS = 2.0
 @dataclass(frozen=True)
 class SchedulerHealthConfig:
     queue_url: Optional[str] = None
+    storage_url: Optional[str] = None
     storage_path: str = DEFAULT_STORAGE_PATH
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
 
@@ -32,6 +33,7 @@ class SchedulerHealthConfig:
         )
         return cls(
             queue_url=os.getenv("AO_SCHEDULER_QUEUE_URL"),
+            storage_url=os.getenv("AO_SCHEDULER_STORAGE_URL"),
             storage_path=os.getenv(
                 "AO_SCHEDULER_STORAGE_PATH",
                 DEFAULT_STORAGE_PATH,
@@ -63,8 +65,21 @@ def check_scheduler_health(
     checks: Dict[str, str] = {}
     errors: Dict[str, str] = {}
 
-    _check_storage(config.storage_path, checks, errors)
-    _check_queue(config.queue_url, config.timeout_seconds, checks, errors)
+    _check_storage_path(config.storage_path, checks, errors)
+    _check_tcp_dependency(
+        "storage_service",
+        config.storage_url,
+        config.timeout_seconds,
+        checks,
+        errors,
+    )
+    _check_tcp_dependency(
+        "queue",
+        config.queue_url,
+        config.timeout_seconds,
+        checks,
+        errors,
+    )
 
     return SchedulerHealthReport(
         healthy=not errors,
@@ -78,6 +93,7 @@ def main(argv: Optional[list] = None) -> int:
         description="Check scheduler queue and storage dependencies.",
     )
     parser.add_argument("--queue-url")
+    parser.add_argument("--storage-url")
     parser.add_argument("--storage-path", default=DEFAULT_STORAGE_PATH)
     parser.add_argument(
         "--timeout",
@@ -88,6 +104,7 @@ def main(argv: Optional[list] = None) -> int:
 
     config = SchedulerHealthConfig(
         queue_url=args.queue_url or os.getenv("AO_SCHEDULER_QUEUE_URL"),
+        storage_url=args.storage_url or os.getenv("AO_SCHEDULER_STORAGE_URL"),
         storage_path=os.getenv(
             "AO_SCHEDULER_STORAGE_PATH",
             args.storage_path,
@@ -104,7 +121,7 @@ def main(argv: Optional[list] = None) -> int:
     return 0 if report.healthy else 1
 
 
-def _check_storage(
+def _check_storage_path(
     storage_path: str,
     checks: Dict[str, str],
     errors: Dict[str, str],
@@ -126,34 +143,35 @@ def _check_storage(
         errors["storage"] = f"{path}: {exc}"
 
 
-def _check_queue(
-    queue_url: Optional[str],
+def _check_tcp_dependency(
+    name: str,
+    dependency_url: Optional[str],
     timeout_seconds: float,
     checks: Dict[str, str],
     errors: Dict[str, str],
 ) -> None:
-    if not queue_url:
-        checks["queue"] = "not configured"
+    if not dependency_url:
+        checks[name] = "not configured"
         return
 
-    parsed = _parse_queue_url(queue_url)
+    parsed = _parse_tcp_url(dependency_url)
     host = parsed.hostname
     port = parsed.port or _default_port(parsed.scheme)
     if not host or not port:
-        errors["queue"] = f"{queue_url}: requires host and port"
+        errors[name] = f"{dependency_url}: requires host and port"
         return
 
     try:
         with socket.create_connection((host, port), timeout_seconds):
-            checks["queue"] = f"reachable:{host}:{port}"
+            checks[name] = f"reachable:{host}:{port}"
     except OSError as exc:
-        errors["queue"] = f"{host}:{port}: {exc}"
+        errors[name] = f"{host}:{port}: {exc}"
 
 
-def _parse_queue_url(queue_url: str):
-    if "://" not in queue_url:
-        queue_url = f"tcp://{queue_url}"
-    return urlparse(queue_url)
+def _parse_tcp_url(dependency_url: str):
+    if "://" not in dependency_url:
+        dependency_url = f"tcp://{dependency_url}"
+    return urlparse(dependency_url)
 
 
 def _default_port(scheme: str) -> Optional[int]:
