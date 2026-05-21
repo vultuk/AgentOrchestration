@@ -13,6 +13,7 @@ class AgentExecutor:
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
         self._execution_context: Dict[str, Dict[str, Any]] = {}
+        self._execution_tasks: Dict[asyncio.Task, str] = {}
         self._cancel_requested: set[str] = set()
 
     async def execute(
@@ -22,6 +23,10 @@ class AgentExecutor:
         handler: Callable,
     ) -> str:
         execution_id = str(uuid4())
+        parent_task = asyncio.current_task()
+        if parent_task is not None:
+            self._execution_tasks[parent_task] = execution_id
+
         async with self._semaphore:
             self._execution_context[execution_id] = {
                 "agent_id": agent_id,
@@ -44,6 +49,8 @@ class AgentExecutor:
             finally:
                 self._active_tasks.pop(execution_id, None)
                 self._execution_context.pop(execution_id, None)
+                if parent_task is not None:
+                    self._execution_tasks.pop(parent_task, None)
                 self._cancel_requested.discard(execution_id)
         return execution_id
 
@@ -68,6 +75,9 @@ class AgentExecutor:
 
     def get_result(self, execution_id: str) -> Optional[Any]:
         return self._results.get(execution_id)
+
+    def execution_id_for(self, task: asyncio.Task) -> Optional[str]:
+        return self._execution_tasks.get(task)
 
     def cancel(self, execution_id: str) -> bool:
         task = self._active_tasks.get(execution_id)
@@ -95,9 +105,11 @@ class AgentExecutor:
             "agent_id": context.get("agent_id"),
             "task_id": context.get("task_id"),
             "status": "cancelled",
+            "cancelled": True,
             "result": None,
             "error": "cancelled",
             "duration": max(0.0, time.time() - started_at),
+            "cancelled_at": time.time(),
             "timestamp": time.time(),
         }
 
