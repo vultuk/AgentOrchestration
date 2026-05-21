@@ -2,21 +2,67 @@
 
 import time
 import logging
-from typing import Callable
+from typing import Callable, Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
+
+from .auth import (
+    AuthService,
+    AuthorizationError,
+    agent_worker_requirements,
+)
+from src.common.errors import AuthenticationError
 
 logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
+    def __init__(self, app, auth_service: Optional[AuthService] = None):
+        super().__init__(app)
+        self.auth_service = auth_service or AuthService()
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
+            requirements = agent_worker_requirements(
+                request.method,
+                request.url.path,
+            )
+            if requirements is None:
+                return await call_next(request)
+
+            token = self._extract_token(request)
+            if not token:
                 return Response(status_code=401, content="Unauthorized")
+            workspace_id = request.headers.get("X-Workspace-ID", "default")
+            required_scope, required_role = requirements
+            try:
+                principal = self.auth_service.authenticate(
+                    token,
+                    required_scope=required_scope,
+                    required_role=required_role,
+                    workspace_id=workspace_id,
+                )
+            except AuthorizationError as exc:
+                return Response(status_code=403, content=str(exc))
+            except AuthenticationError as exc:
+                return Response(status_code=401, content=str(exc))
+            request.state.principal = principal
         return await call_next(request)
+
+    @staticmethod
+    def _extract_token(request: Request) -> str:
+        authorization = request.headers.get("Authorization", "")
+        if authorization.startswith("Bearer "):
+            return authorization.removeprefix("Bearer ").strip()
+        return request.cookies.get("ao_session", "").strip()
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -26,14 +72,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip]
+            if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +96,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
