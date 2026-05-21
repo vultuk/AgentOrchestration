@@ -1,0 +1,15 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY src ./src
+
+RUN pip install --no-cache-dir -e .
+
+ENV AO_SCHEDULER_STORAGE_PATH=/var/lib/agent-orchestrator/scheduler
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD ["python", "-m", "src.orchestrator.scheduler_health"]
+
+CMD ["python", "-m", "src.cli.main", "status"]
