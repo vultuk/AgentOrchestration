@@ -58,6 +58,76 @@ def test_parallel_join_rejects_duplicate_branch_output_namespace():
     )
 
 
+def test_parallel_join_rejects_parent_child_output_namespace_collision():
+    manager = WorkflowManager(metrics_collector=MetricsCollector())
+    workflow = manager.create_workflow("parallel-prefix")
+    executed = []
+
+    workflow.add_step(
+        WorkflowStep(
+            "branch-a",
+            lambda: executed.append("a"),
+            branch_id="branch-a-private",
+            join_id="join-private",
+            output_namespace="results",
+        ),
+    )
+    workflow.add_step(
+        WorkflowStep(
+            "branch-b",
+            lambda: executed.append("b"),
+            branch_id="branch-b-private",
+            join_id="join-private",
+            output_namespace="results.extra",
+        ),
+    )
+
+    assert manager.execute_workflow(workflow.id) is False
+
+    assert executed == []
+    assert workflow.status == StepStatus.FAILED
+    assert workflow.validation_errors[-1]["reason"] == (
+        "duplicate_output_namespace"
+    )
+    assert workflow.validation_errors[-1]["output_namespace"] == (
+        "results.extra"
+    )
+    assert manager.audit_records()[-1]["namespace_ref"] != "results.extra"
+
+
+def test_parallel_join_allows_sibling_output_namespaces():
+    manager = WorkflowManager(metrics_collector=MetricsCollector())
+    workflow = manager.create_workflow("parallel-siblings")
+
+    workflow.add_step(
+        WorkflowStep(
+            "branch-a",
+            lambda: {"answer": 1},
+            branch_id="branch-a-private",
+            join_id="join-private",
+            output_namespace="results.a",
+        ),
+    )
+    workflow.add_step(
+        WorkflowStep(
+            "branch-b",
+            lambda: {"answer": 2},
+            branch_id="branch-b-private",
+            join_id="join-private",
+            output_namespace="results.b",
+        ),
+    )
+
+    assert manager.execute_workflow(workflow.id) is True
+
+    assert workflow.status == StepStatus.COMPLETED
+    assert workflow.outputs == {
+        "results.a": {"branch-a": {"answer": 1}},
+        "results.b": {"branch-b": {"answer": 2}},
+    }
+    assert manager.audit_records() == []
+
+
 def test_parallel_join_rejects_missing_branch_namespace_before_dispatch():
     metrics = MetricsCollector()
     manager = WorkflowManager(metrics_collector=metrics)

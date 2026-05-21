@@ -146,18 +146,33 @@ class WorkflowManager:
                 )
                 continue
 
-            namespace_key = (step.join_id, step.output_namespace)
-            existing = seen_namespaces.get(namespace_key)
-            if existing and existing.branch_id != step.branch_id:
+            join_namespaces = [
+                existing_step
+                for (join_id, _), existing_step in seen_namespaces.items()
+                if join_id == step.join_id
+            ]
+            collision = next(
+                (
+                    existing_step
+                    for existing_step in join_namespaces
+                    if existing_step.branch_id != step.branch_id
+                    and self._namespaces_collide(
+                        step.output_namespace,
+                        existing_step.output_namespace,
+                    )
+                ),
+                None,
+            )
+            if collision:
                 errors.append(
                     self._validation_error(
                         step,
                         "duplicate_output_namespace",
-                        existing,
+                        collision,
                     ),
                 )
                 continue
-            seen_namespaces[namespace_key] = step
+            seen_namespaces[(step.join_id, step.output_namespace)] = step
         return errors
 
     @staticmethod
@@ -223,6 +238,22 @@ class WorkflowManager:
                 namespace[key] = result.get(key)
             return
         namespace[step.name] = result
+
+    @staticmethod
+    def _namespaces_collide(
+        first: Optional[str],
+        second: Optional[str],
+    ) -> bool:
+        if not first or not second:
+            return False
+        if first == second:
+            return True
+        shorter, longer = (
+            (first, second)
+            if len(first) <= len(second)
+            else (second, first)
+        )
+        return longer.startswith(f"{shorter}.")
 
     @staticmethod
     def _safe_ref(value: Any) -> Optional[str]:
