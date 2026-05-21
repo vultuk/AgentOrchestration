@@ -2,32 +2,101 @@
 
 import argparse
 import sys
+import time
+from typing import Callable, List, Optional, TextIO
 
-from src.common.config import Config
 from src.common.logging import configure_logging
 
 
-def cli():
+INTERRUPTED_EXIT_CODE = 130
+
+
+def _print_status(stdout: TextIO) -> None:
+    stdout.write("Checking agent status...\n")
+    stdout.flush()
+
+
+def _run_status(
+    watch: bool,
+    interval: float,
+    sleep: Callable[[float], None],
+    stdout: TextIO,
+    stderr: TextIO,
+) -> int:
+    if not watch:
+        _print_status(stdout)
+        return 0
+
+    try:
+        while True:
+            _print_status(stdout)
+            sleep(interval)
+    except KeyboardInterrupt:
+        stderr.write("status watch interrupted\n")
+        stderr.flush()
+        return INTERRUPTED_EXIT_CODE
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Agent Orchestrator CLI")
     parser.add_argument("--config", "-c", help="Path to config file")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose output",
+    )
 
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        help="Available commands",
+    )
 
-    init_parser = subparsers.add_parser("init", help="Initialize a new project")
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Initialize a new project",
+    )
     init_parser.add_argument("name", help="Project name")
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy an agent")
     deploy_parser.add_argument("manifest", help="Path to agent manifest file")
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
-    status_parser.add_argument("--watch", "-w", action="store_true", help="Watch mode")
+    status_parser.add_argument(
+        "--watch",
+        "-w",
+        action="store_true",
+        help="Watch mode",
+    )
+    status_parser.add_argument(
+        "--interval",
+        type=float,
+        default=2.0,
+        help="Watch refresh interval in seconds",
+    )
 
     logs_parser = subparsers.add_parser("logs", help="View agent logs")
     logs_parser.add_argument("agent_id", help="Agent ID")
-    logs_parser.add_argument("--tail", "-t", type=int, default=50, help="Number of lines")
+    logs_parser.add_argument(
+        "--tail",
+        "-t",
+        type=int,
+        default=50,
+        help="Number of lines",
+    )
+    return parser
 
-    args = parser.parse_args()
+
+def cli(
+    argv: Optional[List[str]] = None,
+    sleep: Callable[[float], None] = time.sleep,
+    stdout: Optional[TextIO] = None,
+    stderr: Optional[TextIO] = None,
+) -> int:
+    stdout = stdout or sys.stdout
+    stderr = stderr or sys.stderr
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     if args.verbose:
         configure_logging("DEBUG")
@@ -35,20 +104,29 @@ def cli():
         configure_logging("INFO")
 
     if args.command == "init":
-        print(f"Initializing project: {args.name}")
+        stdout.write(f"Initializing project: {args.name}\n")
+        return 0
     elif args.command == "deploy":
-        print(f"Deploying agent from manifest: {args.manifest}")
+        stdout.write(f"Deploying agent from manifest: {args.manifest}\n")
+        return 0
     elif args.command == "status":
-        print("Checking agent status...")
+        return _run_status(
+            watch=args.watch,
+            interval=args.interval,
+            sleep=sleep,
+            stdout=stdout,
+            stderr=stderr,
+        )
     elif args.command == "logs":
-        print(f"Fetching logs for agent: {args.agent_id}")
+        stdout.write(f"Fetching logs for agent: {args.agent_id}\n")
+        return 0
     else:
-        parser.print_help()
-        sys.exit(1)
+        parser.print_help(file=stdout)
+        return 1
 
 
 if __name__ == "__main__":
-    cli()
+    sys.exit(cli())
 
 # 2019-01-03T18:44:00 update
 
