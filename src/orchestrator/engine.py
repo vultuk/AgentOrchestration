@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 from src.agent import AgentRegistry, AgentStatus
 from src.orchestrator.scheduler import TaskScheduler
@@ -47,10 +47,10 @@ class OrchestrationEngine:
         agent_id = task["target_agent"]
         logger.info(f"Executing task {task_id} on agent {agent_id}")
 
-        for hook in self._hooks["pre_execute"]:
-            await hook(task)
-
         try:
+            for hook in self._hooks["pre_execute"]:
+                await hook(task)
+
             agent = self.registry.get(agent_id)
             if not agent:
                 raise ValueError(f"Agent {agent_id} not found")
@@ -61,6 +61,7 @@ class OrchestrationEngine:
                 timeout=self.agent_timeout,
             )
             self.registry.update_status(agent_id, AgentStatus.PAUSED)
+            self.scheduler.complete(task_id)
 
             for hook in self._hooks["post_execute"]:
                 await hook(task, result)
@@ -69,6 +70,7 @@ class OrchestrationEngine:
 
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}")
+            self.scheduler.fail(task_id, error=e)
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
 
@@ -82,7 +84,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 

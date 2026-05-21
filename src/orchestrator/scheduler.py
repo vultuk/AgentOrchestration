@@ -1,10 +1,39 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
+import random
 import time
-from typing import Any, Dict, Optional
+from enum import Enum
+from threading import RLock
+from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
+
+
+class TaskState(str, Enum):
+    QUEUED = "queued"
+    SCHEDULED = "scheduled"
+    IN_FLIGHT = "in_flight"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+TERMINAL_STATES = {
+    TaskState.COMPLETED,
+    TaskState.FAILED,
+    TaskState.CANCELLED,
+}
+
+VALID_TRANSITIONS = {
+    TaskState.QUEUED: {TaskState.IN_FLIGHT, TaskState.CANCELLED},
+    TaskState.SCHEDULED: {TaskState.QUEUED, TaskState.CANCELLED},
+    TaskState.IN_FLIGHT: {
+        TaskState.SCHEDULED,
+        TaskState.COMPLETED,
+        TaskState.FAILED,
+        TaskState.CANCELLED,
+    },
+}
 
 
 class PriorityQueue:
@@ -31,55 +60,228 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        max_retries: int = 3,
+        base_retry_delay: float = 0.25,
+        max_retry_delay: float = 30.0,
+        jitter_ratio: float = 0.2,
+        clock: Optional[Callable[[], float]] = None,
+        rng: Optional[random.Random] = None,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
-        self._max_retries = 3
+        self._states: Dict[str, TaskState] = {}
+        self._attempts: Dict[str, int] = {}
+        self._terminal_outcomes: Dict[str, Dict] = {}
+        self._lock = RLock()
+        self._max_retries = max_retries
+        self._base_retry_delay = base_retry_delay
+        self._max_retry_delay = max_retry_delay
+        self._jitter_ratio = jitter_ratio
+        self._clock = clock or time.time
+        self._rng = rng or random.Random()
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        with self._lock:
+            task_id = str(uuid4())
+            task["id"] = task_id
+            task["enqueued_at"] = self._clock()
+            task["retries"] = 0
+            self._attempts[task_id] = 0
+            self._push_current_attempt(task, queue, priority)
+            return task_id
 
-        if queue not in self._queues:
-            self._queues[queue] = PriorityQueue()
-        self._queues[queue].push(task, priority)
-        return task_id
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        with self._lock:
+            task_id = str(uuid4())
+            task["id"] = task_id
+            task["retries"] = 0
+            task["queue"] = queue
+            task["priority"] = priority
+            task["scheduled_for"] = self._clock() + max(0.0, delay)
+            self._attempts[task_id] = 0
+            task["attempt"] = 0
+            self._transition(task_id, TaskState.SCHEDULED)
+            self._scheduled[task_id] = task
+            return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
-        return task_id
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        del timeout
+        with self._lock:
+            self._promote_ready_tasks()
+            if queue not in self._queues:
+                return None
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
-
-        if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
-            if task:
-                self._in_flight[task["id"]] = task
-                return task
-        return None
+            while task:
+                task_id = task.get("id")
+                if self._is_current_attempt(task, TaskState.QUEUED):
+                    self._transition(task_id, TaskState.IN_FLIGHT)
+                    self._in_flight[task_id] = task
+                    task["started_at"] = self._clock()
+                    return task
+                task = self._queues[queue].pop()
+            return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        with self._lock:
+            task = self._in_flight.pop(task_id, None)
+            if not task:
+                return False
+            self._record_terminal(task_id, task, TaskState.COMPLETED)
+            return True
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+    def fail(
+        self,
+        task_id: str,
+        queue: Optional[str] = None,
+        error: Optional[BaseException] = None,
+        retryable: bool = True,
+    ) -> bool:
+        with self._lock:
+            task = self._in_flight.pop(task_id, None)
+            if not task:
+                return False
+
+            task["last_error"] = str(error) if error else ""
+            next_retry = int(task.get("retries", 0)) + 1
+            task["retries"] = next_retry
+
+            if retryable and next_retry <= self._max_retries:
+                self._attempts[task_id] = self._attempts.get(task_id, 0) + 1
+                task["attempt"] = self._attempts[task_id]
+                delay = self._retry_delay(next_retry)
+                task["retry_delay"] = delay
+                task["scheduled_for"] = self._clock() + delay
+                task["queue"] = queue or task.get("queue", "default")
+                self._transition(task_id, TaskState.SCHEDULED)
+                self._scheduled[task_id] = task
                 return True
-        return False
+
+            self._record_terminal(task_id, task, TaskState.FAILED)
+            return True
+
+    def cancel(self, task_id: str) -> bool:
+        with self._lock:
+            if task_id not in self._states or self.is_terminal(task_id):
+                return False
+
+            task = self._in_flight.pop(task_id, None)
+            task = task or self._scheduled.pop(task_id, None)
+            task = task or {"id": task_id}
+            self._record_terminal(task_id, task, TaskState.CANCELLED)
+            return True
+
+    def get_state(self, task_id: str) -> Optional[TaskState]:
+        with self._lock:
+            return self._states.get(task_id)
+
+    def is_terminal(self, task_id: str) -> bool:
+        with self._lock:
+            return self._states.get(task_id) in TERMINAL_STATES
+
+    def terminal_outcome(self, task_id: str) -> Optional[Dict]:
+        with self._lock:
+            outcome = self._terminal_outcomes.get(task_id)
+            return dict(outcome) if outcome else None
+
+    def _push_current_attempt(
+        self,
+        task: Dict,
+        queue: str,
+        priority: int,
+    ) -> None:
+        task_id = task["id"]
+        task["queue"] = queue
+        task["priority"] = priority
+        task["attempt"] = self._attempts[task_id]
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        self._transition(task_id, TaskState.QUEUED)
+        self._queues[queue].push(task, priority)
+
+    def _promote_ready_tasks(self) -> None:
+        now = self._clock()
+        ready = [
+            task_id
+            for task_id, task in self._scheduled.items()
+            if task.get("scheduled_for", 0) <= now
+        ]
+        for task_id in ready:
+            task = self._scheduled.pop(task_id)
+            if not self._is_current_attempt(task, TaskState.SCHEDULED):
+                continue
+            self._push_current_attempt(
+                task,
+                task.get("queue", "default"),
+                int(task.get("priority", 0)),
+            )
+
+    def _is_current_attempt(self, task: Dict, state: TaskState) -> bool:
+        task_id = task.get("id")
+        if not task_id or self.is_terminal(task_id):
+            return False
+        return (
+            self._states.get(task_id) == state
+            and task.get("attempt", 0) == self._attempts.get(task_id, 0)
+        )
+
+    def _retry_delay(self, retry_number: int) -> float:
+        exponent = max(0, retry_number - 1)
+        delay = min(
+            self._max_retry_delay,
+            self._base_retry_delay * (2 ** exponent),
+        )
+        jitter = delay * self._jitter_ratio
+        return max(0.0, self._rng.uniform(delay - jitter, delay + jitter))
+
+    def _record_terminal(
+        self,
+        task_id: str,
+        task: Dict,
+        state: TaskState,
+    ) -> None:
+        finished_at = self._clock()
+        self._scheduled.pop(task_id, None)
+        if not self._transition(task_id, state):
+            return
+        self._terminal_outcomes[task_id] = {
+            "state": state.value,
+            "finished_at": finished_at,
+            "retries": task.get("retries", 0),
+            "attempt": self._attempts.get(task_id, 0),
+        }
+        task["terminal_state"] = state.value
+        task["finished_at"] = finished_at
+
+    def _transition(self, task_id: str, next_state: TaskState) -> bool:
+        current_state = self._states.get(task_id)
+        if current_state in TERMINAL_STATES:
+            return False
+        if current_state is None:
+            self._states[task_id] = next_state
+            return True
+        if next_state not in VALID_TRANSITIONS.get(current_state, set()):
+            return False
+        self._states[task_id] = next_state
+        return True
 
 # 2019-04-25T08:37:12 update
 
