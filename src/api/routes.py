@@ -1,7 +1,7 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
 
@@ -10,15 +10,58 @@ registry = AgentRegistry()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
-    agent_id = registry.register(name, agent_type, config)
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+    protocol_version: Optional[str] = None,
+):
+    try:
+        agent_id = registry.register(
+            name,
+            agent_type,
+            config,
+            protocol_version,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"agent_id": agent_id, "status": "registered"}
+
+
+@router.get("/agents/resolve")
+async def resolve_agent(
+    agent_type: str,
+    protocol_version: Optional[str] = None,
+):
+    agent = registry.resolve(agent_type, protocol_version)
+    if not agent:
+        raise HTTPException(
+            status_code=404,
+            detail="Compatible agent not found",
+        )
+    return agent
+
+
+@router.post("/agents/{agent_id}/protocol")
+async def negotiate_agent_protocol(
+    agent_id: str,
+    protocol_version: str,
+):
+    if not registry.negotiate_protocol_upgrade(agent_id, protocol_version):
+        raise HTTPException(
+            status_code=409,
+            detail="Protocol negotiation rejected or deferred",
+        )
+    return {"status": "protocol_updated"}
 
 
 @router.get("/agents/{agent_id}")

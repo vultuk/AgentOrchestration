@@ -40,6 +40,64 @@ class TestAgentRegistry:
         agent = self.registry.get(agent_id)
         assert agent["status"] == "running"
 
+    def test_register_rejects_incompatible_protocol(self):
+        with pytest.raises(ValueError):
+            self.registry.register(
+                "test-agent",
+                "worker.processor",
+                {"protocol_version": "2.0.0"},
+            )
+        assert self.registry.count() == 0
+        audit = self.registry.audit_log()
+        assert audit[-1]["decision"] == "rejected"
+        assert audit[-1]["reason"] == "incompatible_registration_protocol"
+
+    def test_resolve_rejects_incompatible_protocol(self):
+        self.registry.register("test-agent", "worker.processor")
+        assert self.registry.resolve("worker.processor", "2.0.0") is None
+        audit = self.registry.audit_log()
+        assert audit[-1]["decision"] == "rejected"
+        assert audit[-1]["reason"] == "incompatible_resolution_protocol"
+
+    def test_protocol_upgrade_deferred_during_lifecycle_change(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"protocol_version": "1.0.0", "private_token": "do-not-log"},
+        )
+        assert (
+            self.registry.resolve("worker.processor", "1.0.0")["id"]
+            == agent_id
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        updated = self.registry.negotiate_protocol_upgrade(agent_id, "1.1.0")
+
+        agent = self.registry.get(agent_id)
+        assert not updated
+        assert agent["status"] == "running"
+        assert agent["protocol_version"] == "1.0.0"
+        assert agent["protocol_generation"] == 1
+        audit = self.registry.audit_log()
+        assert audit[-1]["decision"] == "deferred"
+        assert audit[-1]["reason"] == "lifecycle_state_not_stable"
+        assert "private_token" not in audit[-1]
+
+    def test_protocol_upgrade_invalidates_resolution_cache(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+        assert (
+            self.registry.resolve("worker.processor", "1.0.0")["id"]
+            == agent_id
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.STOPPED)
+
+        assert self.registry.negotiate_protocol_upgrade(agent_id, "1.1.0")
+
+        agent = self.registry.resolve("worker.processor", "1.1.0")
+        assert agent["id"] == agent_id
+        assert agent["protocol_version"] == "1.1.0"
+        assert agent["protocol_generation"] == 2
+
     def test_delete_agent(self):
         agent_id = self.registry.register("test-agent", "worker.processor")
         assert self.registry.delete(agent_id)

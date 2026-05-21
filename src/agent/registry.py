@@ -1,10 +1,17 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
+import logging
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from src.common.metrics import metrics
+
+
+logger = logging.getLogger(__name__)
+
+SUPPORTED_PROTOCOL_VERSION = "1.0.0"
 
 
 class AgentStatus(Enum):
@@ -16,13 +23,46 @@ class AgentStatus(Enum):
     TERMINATED = "terminated"
 
 
+UPGRADE_BLOCKING_STATUSES = {
+    AgentStatus.RUNNING.value,
+    AgentStatus.PAUSED.value,
+}
+
+
 class AgentRegistry:
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._resolution_cache: Dict[Tuple[str, str], str] = {}
+        self._audit_log: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+        protocol_version: Optional[str] = None,
+    ) -> str:
+        config = config or {}
+        requested_protocol = str(
+            protocol_version
+            or config.get(
+                "protocol_version",
+                SUPPORTED_PROTOCOL_VERSION,
+            ),
+        )
+        if not self._is_compatible_protocol(requested_protocol):
+            self._record_protocol_decision(
+                "rejected",
+                "incompatible_registration_protocol",
+                agent_type=agent_type,
+                requested_protocol=requested_protocol,
+            )
+            raise ValueError(
+                f"Unsupported agent protocol version: {requested_protocol}",
+            )
+
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -30,22 +70,36 @@ class AgentRegistry:
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": config,
             "created_at": timestamp,
             "updated_at": timestamp,
-            "version": "1.0.0",
+            "version": requested_protocol,
+            "protocol_version": requested_protocol,
+            "protocol_generation": 1,
             "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
         }
         group = agent_type.split(".")[0]
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        self._invalidate_resolution_cache(agent_type)
+        self._record_protocol_decision(
+            "accepted",
+            "registered",
+            agent_id=agent_id,
+            agent_type=agent_type,
+            requested_protocol=requested_protocol,
+        )
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -59,6 +113,123 @@ class AgentRegistry:
             return False
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+        self._invalidate_resolution_cache(self._agents[agent_id]["type"])
+        return True
+
+    def resolve(
+        self,
+        agent_type: str,
+        required_protocol_version: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        required_protocol = str(
+            required_protocol_version
+            or SUPPORTED_PROTOCOL_VERSION
+        )
+        cache_key = (agent_type, required_protocol)
+        cached_agent_id = self._resolution_cache.get(cache_key)
+        cached_agent = self._agents.get(cached_agent_id or "")
+        if cached_agent and self._agent_matches_resolution(
+            cached_agent,
+            agent_type,
+            required_protocol,
+        ):
+            return cached_agent
+
+        if not self._is_compatible_protocol(required_protocol):
+            self._record_protocol_decision(
+                "rejected",
+                "incompatible_resolution_protocol",
+                agent_type=agent_type,
+                requested_protocol=required_protocol,
+            )
+            return None
+
+        for agent in self._agents.values():
+            if self._agent_matches_resolution(
+                agent,
+                agent_type,
+                required_protocol,
+            ):
+                self._resolution_cache[cache_key] = agent["id"]
+                return agent
+
+        self._record_protocol_decision(
+            "rejected",
+            "no_compatible_handler",
+            agent_type=agent_type,
+            requested_protocol=required_protocol,
+        )
+        return None
+
+    def negotiate_protocol_upgrade(
+        self,
+        agent_id: str,
+        requested_protocol_version: str,
+        actor: str = "agent_rpc_negotiation",
+    ) -> bool:
+        agent = self._agents.get(agent_id)
+        if not agent:
+            return False
+
+        requested_protocol_version = str(requested_protocol_version)
+        if not self._is_compatible_protocol(requested_protocol_version):
+            self._record_protocol_decision(
+                "rejected",
+                "incompatible_upgrade_protocol",
+                agent_id=agent_id,
+                agent_type=agent["type"],
+                requested_protocol=requested_protocol_version,
+                current_protocol=agent.get("protocol_version"),
+                status=agent["status"],
+                actor=actor,
+            )
+            return False
+
+        current_protocol = agent.get(
+            "protocol_version",
+            SUPPORTED_PROTOCOL_VERSION,
+        )
+        if requested_protocol_version == current_protocol:
+            self._record_protocol_decision(
+                "rejected",
+                "duplicate_upgrade_protocol",
+                agent_id=agent_id,
+                agent_type=agent["type"],
+                requested_protocol=requested_protocol_version,
+                current_protocol=current_protocol,
+                status=agent["status"],
+                actor=actor,
+            )
+            return False
+
+        if agent["status"] in UPGRADE_BLOCKING_STATUSES:
+            self._record_protocol_decision(
+                "deferred",
+                "lifecycle_state_not_stable",
+                agent_id=agent_id,
+                agent_type=agent["type"],
+                requested_protocol=requested_protocol_version,
+                current_protocol=current_protocol,
+                status=agent["status"],
+                actor=actor,
+            )
+            return False
+
+        agent["version"] = requested_protocol_version
+        agent["protocol_version"] = requested_protocol_version
+        agent["protocol_generation"] += 1
+        agent["updated_at"] = time.time()
+        self._invalidate_resolution_cache(agent["type"])
+        self._record_protocol_decision(
+            "accepted",
+            "upgraded",
+            agent_id=agent_id,
+            agent_type=agent["type"],
+            requested_protocol=requested_protocol_version,
+            current_protocol=current_protocol,
+            status=agent["status"],
+            actor=actor,
+        )
         return True
 
     def delete(self, agent_id: str) -> bool:
@@ -68,10 +239,94 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._invalidate_resolution_cache(agent["type"])
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def audit_log(self) -> List[Dict[str, Any]]:
+        return [dict(entry) for entry in self._audit_log]
+
+    def _agent_matches_resolution(
+        self,
+        agent: Dict[str, Any],
+        agent_type: str,
+        required_protocol: str,
+    ) -> bool:
+        if agent["type"] != agent_type:
+            return False
+        if agent["status"] in {
+            AgentStatus.FAILED.value,
+            AgentStatus.TERMINATED.value,
+        }:
+            return False
+        return self._protocol_major(
+            agent.get("protocol_version"),
+        ) == self._protocol_major(required_protocol)
+
+    def _invalidate_resolution_cache(self, agent_type: str) -> None:
+        stale_keys = [
+            key
+            for key, agent_id in self._resolution_cache.items()
+            if self._agents.get(agent_id, {}).get("type") == agent_type
+            or key[0] == agent_type
+        ]
+        for key in stale_keys:
+            self._resolution_cache.pop(key, None)
+
+    def _is_compatible_protocol(self, protocol_version: str) -> bool:
+        try:
+            return self._protocol_major(
+                protocol_version,
+            ) == self._protocol_major(SUPPORTED_PROTOCOL_VERSION)
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _protocol_major(protocol_version: Optional[str]) -> int:
+        if not protocol_version:
+            raise ValueError("protocol version is required")
+        parts = protocol_version.split(".")
+        if len(parts) != 3 or not all(part.isdigit() for part in parts):
+            raise ValueError(f"invalid protocol version: {protocol_version}")
+        return int(parts[0])
+
+    def _record_protocol_decision(
+        self,
+        decision: str,
+        reason: str,
+        *,
+        agent_id: str = "",
+        agent_type: str = "",
+        requested_protocol: str = "",
+        current_protocol: str = "",
+        status: str = "",
+        actor: str = "",
+    ) -> None:
+        entry = {
+            "timestamp": time.time(),
+            "decision": decision,
+            "reason": reason,
+            "agent_id": agent_id,
+            "agent_type": agent_type,
+            "requested_protocol": requested_protocol,
+            "current_protocol": current_protocol,
+            "status": status,
+            "actor": actor,
+        }
+        self._audit_log.append(entry)
+        metrics.increment(
+            f"agent_registry.protocol_negotiation.{decision}",
+        )
+        logger.info(
+            "agent_protocol_decision decision=%s reason=%s "
+            "agent_id=%s agent_type=%s",
+            decision,
+            reason,
+            agent_id,
+            agent_type,
+        )
 
 # 2019-01-29T11:24:49 update
 
