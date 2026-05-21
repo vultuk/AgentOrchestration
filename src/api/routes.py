@@ -1,22 +1,32 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException, Response
+from typing import Dict, Optional
 
+from src.common.export_policy import ExportFormat
+from src.orchestrator.scheduler import TaskScheduler
 from src.agent import AgentRegistry, AgentStatus
 
 router = APIRouter()
 registry = AgentRegistry()
+task_scheduler = TaskScheduler()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +63,22 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.get("/tasks/export/json")
+async def export_tasks_json():
+    return {"tasks": task_scheduler.export_tasks(ExportFormat.JSON)}
+
+
+@router.get("/tasks/export/csv")
+async def export_tasks_csv():
+    content = task_scheduler.export_tasks(ExportFormat.CSV)
+    return Response(content=content, media_type="text/csv")
+
+
+@router.get("/tasks/ui")
+async def task_ui_records():
+    return {"tasks": task_scheduler.export_tasks(ExportFormat.UI)}
 
 # 2019-03-18T11:10:18 update
 

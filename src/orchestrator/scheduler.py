@@ -1,10 +1,12 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from copy import deepcopy
+from typing import Any, Dict, List, Optional, Union
 from uuid import uuid4
+
+from src.common.export_policy import ExportFormat, export_task_records
 
 
 class PriorityQueue:
@@ -29,42 +31,79 @@ class PriorityQueue:
     def __len__(self) -> int:
         return len(self._queue)
 
+    def items(self) -> List[Any]:
+        return [entry[2] for entry in sorted(self._queue)]
+
 
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = task.get("id", str(uuid4()))
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["enqueued_at"] = task.get("enqueued_at", time.time())
+        task["retries"] = task.get("retries", 0)
+        task["queue"] = queue
+        task["priority"] = priority
+        task["status"] = "queued"
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        scheduled = deepcopy(task)
+        scheduled["id"] = task_id
+        scheduled["scheduled_for"] = time.time() + delay
+        scheduled["retries"] = scheduled.get("retries", 0)
+        scheduled["queue"] = queue
+        scheduled["priority"] = priority
+        scheduled["status"] = "scheduled"
+        self._scheduled[task_id] = scheduled
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid
+            for tid, task in self._scheduled.items()
+            if task["scheduled_for"] <= now
+        ]
         for tid in expired:
             task = self._scheduled.pop(tid)
             if task:
-                self.enqueue(task, queue)
+                task.pop("scheduled_for", None)
+                self.enqueue(
+                    task,
+                    queue=task.get("queue", queue),
+                    priority=task.get("priority", 0),
+                )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                task["status"] = "in_flight"
                 self._in_flight[task["id"]] = task
                 return task
         return None
@@ -80,6 +119,31 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def list_task_records(self) -> List[Dict]:
+        records: List[Dict] = []
+
+        for queue, task_queue in self._queues.items():
+            for task in task_queue.items():
+                record = deepcopy(task)
+                record.setdefault("queue", queue)
+                record.setdefault("status", "queued")
+                records.append(record)
+
+        for task in self._scheduled.values():
+            record = deepcopy(task)
+            record.setdefault("status", "scheduled")
+            records.append(record)
+
+        for task in self._in_flight.values():
+            record = deepcopy(task)
+            record.setdefault("status", "in_flight")
+            records.append(record)
+
+        return records
+
+    def export_tasks(self, export_format: Union[ExportFormat, str]):
+        return export_task_records(self.list_task_records(), export_format)
 
 # 2019-04-25T08:37:12 update
 
