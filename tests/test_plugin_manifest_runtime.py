@@ -100,3 +100,52 @@ def test_duplicate_concurrent_execution_records_one_terminal_outcome():
         )
 
     asyncio.run(run_test())
+
+
+def test_retry_preserves_task_identity_until_terminal_outcome():
+    async def run_test():
+        engine = OrchestrationEngine()
+        agent_id = engine.registry.register("plugin-worker", "worker.plugin")
+        calls = []
+
+        async def fail_once(agent, task):
+            calls.append(("fail", task["id"]))
+            raise RuntimeError("transient worker failure")
+
+        async def succeed(agent, task):
+            calls.append(("success", task["id"]))
+            return {"ok": True}
+
+        engine._run_agent_task = fail_once
+        task_id = engine.scheduler.enqueue(
+            {
+                "type": "plugin-load",
+                "target_agent": agent_id,
+                "plugin_manifest": {"name": "plugin", "hooks": []},
+            }
+        )
+
+        first_attempt = await engine.scheduler.dequeue()
+        await engine._execute_task(first_attempt)
+
+        assert engine.get_task_outcome(task_id) is None
+        assert task_id not in engine.scheduler._in_flight
+
+        retry_attempt = await engine.scheduler.dequeue()
+        assert retry_attempt["id"] == task_id
+        assert retry_attempt["retries"] == 1
+
+        engine._run_agent_task = succeed
+        await engine._execute_task(retry_attempt)
+
+        outcome = engine.get_task_outcome(task_id)
+        assert outcome["status"] == "completed"
+        assert outcome["result"] == {"ok": True}
+        assert calls == [("fail", task_id), ("success", task_id)]
+        assert task_id not in engine.scheduler._in_flight
+        assert (
+            engine.registry.get(agent_id)["status"]
+            == AgentStatus.PAUSED.value
+        )
+
+    asyncio.run(run_test())
