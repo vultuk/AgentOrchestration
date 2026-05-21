@@ -1,4 +1,5 @@
-import pytest
+import time
+
 from src.common.metrics import MetricsCollector
 
 
@@ -26,10 +27,28 @@ class TestMetricsCollector:
 
     def test_timer(self):
         self.metrics.start_timer("operation")
-        import time
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+        snapshot = self.metrics.snapshot()
+        assert snapshot["active_timers"] == 0
+        assert snapshot["histograms"]["operation"]["count"] == 1
+
+    def test_snapshot_includes_active_timer_count_without_timer_names(self):
+        self.metrics.start_timer("operation-a")
+        self.metrics.start_timer("operation-b")
+
+        snapshot = self.metrics.snapshot()
+
+        assert snapshot["active_timers"] == 2
+        assert "timers" not in snapshot
+        assert "operation-a" not in snapshot
+        assert "operation-b" not in snapshot
+
+        self.metrics.stop_timer("operation-a")
+        snapshot = self.metrics.snapshot()
+
+        assert snapshot["active_timers"] == 1
 
 # 2019-07-16T09:29:21 update
 
