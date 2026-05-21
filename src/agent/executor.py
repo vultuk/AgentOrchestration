@@ -11,25 +11,63 @@ class AgentExecutor:
         self.max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
+        self._execution_metadata: Dict[str, Dict[str, Any]] = {}
+        self._terminal_outcomes: Dict[str, Dict[str, Any]] = {}
         self._results: Dict[str, Any] = {}
 
-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
+    async def execute(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+        handler: Callable,
+    ) -> str:
         execution_id = str(uuid4())
         async with self._semaphore:
+            self._execution_metadata[execution_id] = {
+                "agent_id": agent_id,
+                "task_id": task.get("id"),
+            }
             task_obj = asyncio.create_task(
                 self._run_execution(execution_id, agent_id, task, handler)
             )
             self._active_tasks[execution_id] = task_obj
             try:
                 result = await task_obj
-                self._results[execution_id] = result
+                outcome = self._terminal_outcomes.get(execution_id)
+                if outcome:
+                    self._results[execution_id] = outcome
+                else:
+                    self._record_terminal_outcome(
+                        execution_id,
+                        "completed",
+                        "execution_completed",
+                    )
+                    self._results[execution_id] = result
+            except asyncio.CancelledError:
+                outcome = self._record_terminal_outcome(
+                    execution_id,
+                    "cancelled",
+                    "execution_cancelled",
+                )
+                self._results[execution_id] = outcome
             except Exception as e:
-                self._results[execution_id] = {"error": str(e)}
+                outcome = self._record_terminal_outcome(
+                    execution_id,
+                    "failed",
+                    f"execution_failed: {e}",
+                )
+                self._results[execution_id] = outcome
             finally:
                 self._active_tasks.pop(execution_id, None)
         return execution_id
 
-    async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+    async def _run_execution(
+        self,
+        exec_id: str,
+        agent_id: str,
+        task: Dict,
+        handler: Callable,
+    ) -> Any:
         start = time.time()
         result = await handler(agent_id, task)
         duration = time.time() - start
@@ -43,20 +81,69 @@ class AgentExecutor:
         }
 
     def get_result(self, execution_id: str) -> Optional[Any]:
-        return self._results.get(execution_id)
+        return (
+            self._results.get(execution_id)
+            or self._terminal_outcomes.get(execution_id)
+        )
 
     def cancel(self, execution_id: str) -> bool:
         task = self._active_tasks.get(execution_id)
         if task and not task.done():
+            self._record_terminal_outcome(
+                execution_id,
+                "cancelled",
+                "execution_cancelled",
+            )
             task.cancel()
             return True
         return False
 
     async def shutdown(self) -> None:
-        for task in self._active_tasks.values():
+        for execution_id, task in list(self._active_tasks.items()):
+            self._record_terminal_outcome(
+                execution_id,
+                "cancelled",
+                "executor_shutdown",
+            )
             task.cancel()
         if self._active_tasks:
-            await asyncio.gather(*self._active_tasks.values(), return_exceptions=True)
+            await asyncio.gather(
+                *self._active_tasks.values(),
+                return_exceptions=True,
+            )
+
+    def _record_terminal_outcome(
+        self,
+        execution_id: str,
+        state: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        existing = self._terminal_outcomes.get(execution_id)
+        if existing:
+            return existing
+
+        metadata = self._execution_metadata.get(execution_id, {})
+        outcome = {
+            "execution_id": execution_id,
+            "agent_id": metadata.get("agent_id"),
+            "task_id": metadata.get("task_id"),
+            "state": state,
+            "reason": reason,
+            "recorded_at": time.time(),
+        }
+        self._terminal_outcomes[execution_id] = outcome
+        self._results[execution_id] = outcome
+        return outcome
+
+    def get_terminal_outcome(
+        self,
+        execution_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        outcome = self._terminal_outcomes.get(execution_id)
+        return dict(outcome) if outcome else None
+
+    def active_execution_ids(self) -> list:
+        return list(self._active_tasks)
 
 # 2019-01-31T14:19:34 update
 

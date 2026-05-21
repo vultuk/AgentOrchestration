@@ -4,8 +4,9 @@ import os
 import signal
 import subprocess
 import logging
+import time
 from enum import Enum
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -22,13 +23,83 @@ class AgentRuntime:
     def __init__(self):
         self._processes: Dict[str, subprocess.Popen] = {}
         self._states: Dict[str, RuntimeState] = {}
+        self._terminal_outcomes: Dict[str, Dict[str, Any]] = {}
 
-    def start(self, agent_id: str, command: list, env: Optional[Dict] = None) -> bool:
-        if agent_id in self._processes and self._processes[agent_id].poll() is None:
+    def _transition(self, agent_id: str, state: RuntimeState) -> bool:
+        current = self._states.get(agent_id, RuntimeState.STOPPED)
+        if current == state:
+            return True
+
+        allowed = {
+            RuntimeState.STOPPED: {RuntimeState.STARTING},
+            RuntimeState.STARTING: {
+                RuntimeState.RUNNING,
+                RuntimeState.CRASHED,
+                RuntimeState.STOPPED,
+            },
+            RuntimeState.RUNNING: {
+                RuntimeState.STOPPING,
+                RuntimeState.CRASHED,
+            },
+            RuntimeState.STOPPING: {
+                RuntimeState.STOPPED,
+                RuntimeState.CRASHED,
+            },
+            RuntimeState.CRASHED: {RuntimeState.STARTING},
+        }
+        if state not in allowed[current]:
+            logger.warning(
+                "Rejected invalid runtime transition for agent %s: %s -> %s",
+                agent_id,
+                current.value,
+                state.value,
+            )
+            return False
+
+        self._states[agent_id] = state
+        return True
+
+    def _record_terminal_outcome(
+        self,
+        agent_id: str,
+        state: RuntimeState,
+        reason: str,
+        *,
+        returncode: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        existing = self._terminal_outcomes.get(agent_id)
+        if existing:
+            return existing
+
+        proc = self._processes.get(agent_id)
+        outcome = {
+            "agent_id": agent_id,
+            "state": state.value,
+            "reason": reason,
+            "pid": proc.pid if proc else None,
+            "returncode": returncode,
+            "recorded_at": time.time(),
+        }
+        self._terminal_outcomes[agent_id] = outcome
+        return outcome
+
+    def start(
+        self,
+        agent_id: str,
+        command: list,
+        env: Optional[Dict] = None,
+    ) -> bool:
+        if (
+            agent_id in self._processes
+            and self._processes[agent_id].poll() is None
+        ):
             logger.warning(f"Agent {agent_id} is already running")
             return False
 
-        self._states[agent_id] = RuntimeState.STARTING
+        self._terminal_outcomes.pop(agent_id, None)
+        if not self._transition(agent_id, RuntimeState.STARTING):
+            return False
+
         process_env = os.environ.copy()
         if env:
             process_env.update(env)
@@ -42,20 +113,33 @@ class AgentRuntime:
                 stderr=subprocess.PIPE,
             )
             self._processes[agent_id] = proc
-            self._states[agent_id] = RuntimeState.RUNNING
+            self._transition(agent_id, RuntimeState.RUNNING)
             logger.info(f"Agent {agent_id} started (PID: {proc.pid})")
             return True
         except Exception as e:
-            self._states[agent_id] = RuntimeState.CRASHED
+            self._record_terminal_outcome(
+                agent_id,
+                RuntimeState.CRASHED,
+                f"start_failed: {e}",
+            )
+            self._transition(agent_id, RuntimeState.CRASHED)
             logger.error(f"Failed to start agent {agent_id}: {e}")
             return False
 
-    def stop(self, agent_id: str, timeout: int = 10) -> bool:
+    def stop(
+        self,
+        agent_id: str,
+        timeout: int = 10,
+        reason: str = "worker_shutdown_requested",
+    ) -> bool:
         proc = self._processes.get(agent_id)
         if not proc or proc.poll() is not None:
             return False
 
-        self._states[agent_id] = RuntimeState.STOPPING
+        if not self._transition(agent_id, RuntimeState.STOPPING):
+            return False
+        self._record_terminal_outcome(agent_id, RuntimeState.STOPPED, reason)
+
         proc.send_signal(signal.SIGTERM)
         try:
             proc.wait(timeout=timeout)
@@ -63,19 +147,34 @@ class AgentRuntime:
             proc.kill()
             proc.wait()
 
-        self._states[agent_id] = RuntimeState.STOPPED
+        self._transition(agent_id, RuntimeState.STOPPED)
         logger.info(f"Agent {agent_id} stopped")
         return True
 
     def get_state(self, agent_id: str) -> RuntimeState:
         proc = self._processes.get(agent_id)
         if proc and proc.poll() is not None:
-            self._states[agent_id] = RuntimeState.CRASHED
+            outcome = self._terminal_outcomes.get(agent_id)
+            if outcome and outcome["state"] == RuntimeState.STOPPED.value:
+                self._states[agent_id] = RuntimeState.STOPPED
+            else:
+                returncode = proc.returncode
+                self._record_terminal_outcome(
+                    agent_id,
+                    RuntimeState.CRASHED,
+                    f"process_exited_before_shutdown: {returncode}",
+                    returncode=returncode,
+                )
+                self._transition(agent_id, RuntimeState.CRASHED)
         return self._states.get(agent_id, RuntimeState.STOPPED)
 
     def is_running(self, agent_id: str) -> bool:
         proc = self._processes.get(agent_id)
         return proc is not None and proc.poll() is None
+
+    def get_terminal_outcome(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        outcome = self._terminal_outcomes.get(agent_id)
+        return dict(outcome) if outcome else None
 
 # 2019-01-11T10:56:26 update
 
