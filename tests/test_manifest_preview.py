@@ -49,6 +49,62 @@ resources:
     assert captured.err == ""
 
 
+def test_dry_run_can_diff_against_previous_approved_manifest(
+    tmp_path,
+    capsys,
+):
+    previous = tmp_path / "previous.yaml"
+    previous.write_text(
+        """
+name: checkout
+resources:
+  - kind: Deployment
+    name: api
+    env:
+      IMAGE_TAG: stable
+      API_TOKEN: previous-secret
+""",
+        encoding="utf-8",
+    )
+    candidate = tmp_path / "candidate.yaml"
+    candidate.write_text(
+        """
+name: checkout
+resources:
+  - kind: Deployment
+    name: api
+    env:
+      IMAGE_TAG: candidate
+      API_TOKEN: candidate-secret
+""",
+        encoding="utf-8",
+    )
+
+    code = cli(
+        [
+            "deploy",
+            str(candidate),
+            "--dry-run",
+            "--previous",
+            str(previous),
+            "--set",
+            "resources.0.env.IMAGE_TAG=release",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert 'resources.0.env.IMAGE_TAG: "stable" -> "release"' in captured.out
+    assert (
+        "resources.0.env.API_TOKEN: <redacted> -> <redacted>"
+        in captured.out
+    )
+    assert "previous-secret" not in captured.out
+    assert "candidate-secret" not in captured.out
+    assert captured.err == ""
+
+
 def test_invalid_manifest_fails_before_deploy_approval(tmp_path, capsys):
     manifest = tmp_path / "release.yaml"
     manifest.write_text(

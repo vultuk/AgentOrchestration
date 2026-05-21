@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -108,11 +108,16 @@ def validate_manifest(manifest: Dict[str, Any]) -> None:
 def render_preview(
     path: str,
     assignments: List[str],
+    previous_path: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], List[str]]:
     original = load_manifest(path)
     rendered = apply_overrides(original, assignments)
     validate_manifest(rendered)
-    return rendered, build_review_diff(original, rendered)
+    diff_base = original
+    if previous_path:
+        diff_base = load_manifest(previous_path)
+        validate_manifest(diff_base)
+    return rendered, build_review_diff(diff_base, rendered)
 
 
 def build_review_diff(

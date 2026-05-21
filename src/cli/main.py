@@ -42,6 +42,10 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY=VALUE",
         help="Set release-candidate manifest value",
     )
+    deploy_parser.add_argument(
+        "--previous",
+        help="Path to previously approved manifest for review diff",
+    )
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
     status_parser.add_argument(
@@ -77,7 +81,11 @@ def cli(argv=None) -> int:
     elif args.command == "deploy":
         if args.dry_run:
             try:
-                _, changes = render_preview(args.manifest, args.set)
+                _, changes = render_preview(
+                    args.manifest,
+                    args.set,
+                    args.previous,
+                )
             except ManifestPreviewError as exc:
                 print(f"Dry-run validation failed: {exc}", file=sys.stderr)
                 return 1
