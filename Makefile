@@ -12,9 +12,11 @@ lint:
 
 verify-dependency-manifests:
 	@echo "Checking generated dependency manifest; regenerate with: uv lock"
-	@if [ -n "$$(git status --porcelain -- uv.lock)" ]; then \
+	@uv lock
+	@if [ -n "$$(git status --porcelain -- pyproject.toml uv.lock)" ]; then \
 		echo "::error file=uv.lock::Generated dependency manifest is stale. Run 'uv lock' and commit uv.lock."; \
-		git status --short -- uv.lock; \
+		git status --short -- pyproject.toml uv.lock; \
+		git diff -- pyproject.toml uv.lock; \
 		exit 1; \
 	fi
 
