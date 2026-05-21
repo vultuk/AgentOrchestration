@@ -52,6 +52,17 @@ def client():
     return TestClient(create_app({"auth_service": auth_service}))
 
 
+def client_with_strict_staleness():
+    auth_service = AuthService(
+        secret=SECRET,
+        expected_audience="agent-workers",
+        expected_issuer="agent-control-plane",
+        max_token_age_seconds=30,
+        now=lambda: NOW,
+    )
+    return TestClient(create_app({"auth_service": auth_service}))
+
+
 def headers(token):
     return {
         "Authorization": f"Bearer {token}",
@@ -93,6 +104,39 @@ def test_agent_worker_rejects_wrong_jwt_audience():
     response = client().get("/api/v2/agents", headers=headers(token))
 
     assert response.status_code == 401
+
+
+def test_agent_worker_rejects_wrong_jwt_issuer_when_configured():
+    token = make_token(iss="unknown-issuer", iat=NOW)
+
+    response = client_with_strict_staleness().get(
+        "/api/v2/agents",
+        headers=headers(token),
+    )
+
+    assert response.status_code == 401
+
+
+def test_agent_worker_rejects_token_older_than_configured_max_age():
+    token = make_token(iss="agent-control-plane", iat=NOW - 31)
+
+    response = client_with_strict_staleness().get(
+        "/api/v2/agents",
+        headers=headers(token),
+    )
+
+    assert response.status_code == 401
+
+
+def test_agent_worker_accepts_recent_token_when_strict_staleness_configured():
+    token = make_token(iss="agent-control-plane", iat=NOW - 10)
+
+    response = client_with_strict_staleness().get(
+        "/api/v2/agents",
+        headers=headers(token),
+    )
+
+    assert response.status_code == 200
 
 
 def test_agent_worker_rejects_insufficient_scope():

@@ -31,6 +31,8 @@ class AuthService:
         self,
         secret: Optional[str] = None,
         expected_audience: Optional[str] = None,
+        expected_issuer: Optional[str] = None,
+        max_token_age_seconds: Optional[int] = None,
         revoked_token_ids: Optional[Iterable[str]] = None,
         now: Optional[Callable[[], float]] = None,
     ):
@@ -40,6 +42,14 @@ class AuthService:
         self.expected_audience = expected_audience or os.getenv(
             "AO_WORKER_JWT_AUDIENCE",
             "agent-workers",
+        )
+        self.expected_issuer = (
+            expected_issuer
+            if expected_issuer is not None
+            else os.getenv("AO_WORKER_JWT_ISSUER") or None
+        )
+        self.max_token_age_seconds = self._configured_max_token_age(
+            max_token_age_seconds,
         )
         self.revoked_token_ids = set(revoked_token_ids or [])
         self._now = now or time.time
@@ -54,6 +64,7 @@ class AuthService:
     ) -> Principal:
         claims = self._decode_and_verify(token)
         self._require_audience(claims)
+        self._require_issuer(claims)
         self._require_fresh_token(claims)
         self._require_not_revoked(claims)
 
@@ -121,6 +132,12 @@ class AuthService:
         if self.expected_audience not in audiences:
             raise AuthenticationError("Invalid JWT audience")
 
+    def _require_issuer(self, claims: Dict[str, Any]) -> None:
+        if self.expected_issuer is None:
+            return
+        if claims.get("iss") != self.expected_issuer:
+            raise AuthenticationError("Invalid JWT issuer")
+
     def _require_fresh_token(self, claims: Dict[str, Any]) -> None:
         expires_at = claims.get("exp")
         if not isinstance(expires_at, (int, float)):
@@ -132,10 +149,37 @@ class AuthService:
         if isinstance(not_before, (int, float)) and not_before > self._now():
             raise AuthenticationError("Token is not active yet")
 
+        issued_at = claims.get("iat")
+        if isinstance(issued_at, (int, float)) and issued_at > self._now():
+            raise AuthenticationError("Token was issued in the future")
+        if self.max_token_age_seconds is None:
+            return
+        if not isinstance(issued_at, (int, float)):
+            raise AuthenticationError("Missing token issue time")
+        if self._now() - issued_at > self.max_token_age_seconds:
+            raise AuthenticationError("Token is too old")
+
     def _require_not_revoked(self, claims: Dict[str, Any]) -> None:
         token_id = claims.get("jti")
         if isinstance(token_id, str) and token_id in self.revoked_token_ids:
             raise AuthenticationError("Token has been revoked")
+
+    @staticmethod
+    def _configured_max_token_age(
+        max_token_age_seconds: Optional[int],
+    ) -> Optional[int]:
+        if max_token_age_seconds is not None:
+            return max_token_age_seconds
+        raw_value = os.getenv("AO_WORKER_JWT_MAX_AGE_SECONDS")
+        if raw_value in {None, ""}:
+            return None
+        try:
+            parsed = int(raw_value)
+        except ValueError as exc:
+            raise ValueError(
+                "AO_WORKER_JWT_MAX_AGE_SECONDS must be an integer"
+            ) from exc
+        return parsed if parsed > 0 else None
 
     @staticmethod
     def _extract_scopes(claims: Dict[str, Any]) -> Set[str]:
