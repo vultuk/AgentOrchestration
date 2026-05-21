@@ -6,15 +6,22 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.orchestrator.event_store import EventRetentionStore
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
 
 
 class OrchestrationEngine:
-    def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
+    def __init__(
+        self,
+        max_workers: int = 10,
+        agent_timeout: int = 300,
+        event_store: Optional[EventRetentionStore] = None,
+    ):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
+        self.event_store = event_store or EventRetentionStore()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
@@ -46,6 +53,12 @@ class OrchestrationEngine:
         task_id = task["id"]
         agent_id = task["target_agent"]
         logger.info(f"Executing task {task_id} on agent {agent_id}")
+        self.event_store.record_task_event(
+            "task.started",
+            task_id,
+            {"agent_id": agent_id},
+            actor=agent_id,
+        )
 
         for hook in self._hooks["pre_execute"]:
             await hook(task)
@@ -65,10 +78,27 @@ class OrchestrationEngine:
             for hook in self._hooks["post_execute"]:
                 await hook(task, result)
 
+            self.event_store.record_task_event(
+                "task.completed",
+                task_id,
+                {"agent_id": agent_id, "result": result},
+                actor=agent_id,
+            )
             logger.info(f"Task {task_id} completed successfully")
 
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}")
+            self.event_store.record_task_event(
+                "task.failed",
+                task_id,
+                {
+                    "agent_id": agent_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+                actor=agent_id,
+                severity="error",
+            )
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
 
@@ -82,7 +112,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 
