@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,73 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_recovery_defers_over_capacity_tenant_after_restart(self):
+        import asyncio
+
+        scheduler = TaskScheduler(max_concurrent_per_tenant=1)
+        first_task = {
+            "id": "task-a",
+            "tenant_id": "tenant-1",
+            "state": "running",
+            "payload": {"private": "not-for-audit"},
+        }
+        second_task = {
+            "id": "task-b",
+            "tenant_id": "tenant-1",
+            "state": "running",
+            "payload": {"private": "not-for-audit"},
+        }
+
+        result = scheduler.recover_after_restart([first_task, second_task])
+
+        assert result == {
+            "accepted": ["task-a"],
+            "deferred": ["task-b"],
+            "rejected": [],
+        }
+        recovered = asyncio.run(scheduler.dequeue())
+        assert recovered["id"] == "task-a"
+        assert recovered["state"] == "running"
+        assert asyncio.run(scheduler.dequeue()) is None
+        assert "task-b" in scheduler.deferred_recovery
+
+        deferred_audit = [
+            entry for entry in scheduler.audit_log
+            if entry["task_id"] == "task-b"
+        ][-1]
+        assert deferred_audit["decision"] == "deferred"
+        assert deferred_audit["reason"] == "tenant_concurrency_limit"
+        assert deferred_audit["tenant_id"] == "tenant-1"
+        assert "payload" not in deferred_audit
+
+        assert scheduler.complete("task-a")
+        assert "task-b" not in scheduler.deferred_recovery
+        released = asyncio.run(scheduler.dequeue())
+        assert released["id"] == "task-b"
+
+    def test_recovery_rejects_duplicate_restart_task(self):
+        scheduler = TaskScheduler(max_concurrent_per_tenant=1)
+        task_id = scheduler.enqueue({
+            "id": "already-queued",
+            "tenant_id": "tenant-1",
+        })
+
+        result = scheduler.recover_after_restart([
+            {"id": task_id, "tenant_id": "tenant-1", "state": "running"}
+        ])
+
+        assert result == {
+            "accepted": [],
+            "deferred": [],
+            "rejected": [task_id],
+        }
+        rejection = [
+            entry for entry in scheduler.audit_log
+            if entry["task_id"] == task_id
+        ][-1]
+        assert rejection["decision"] == "rejected"
+        assert rejection["reason"] == "duplicate_task"
 
 # 2019-01-09T19:07:03 update
 
