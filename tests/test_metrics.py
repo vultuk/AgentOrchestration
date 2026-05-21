@@ -1,4 +1,3 @@
-import pytest
 from src.common.metrics import MetricsCollector
 
 
@@ -30,6 +29,23 @@ class TestMetricsCollector:
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+        snapshot = self.metrics.snapshot()
+        assert snapshot["histograms"]["operation"]["count"] == 1
+
+    def test_snapshot_is_isolated_from_caller_mutation(self):
+        self.metrics.increment("requests.total")
+        self.metrics.gauge("exporter.payload", {"labels": ["worker"]})
+        self.metrics.observe("response.time", 0.5)
+
+        snapshot = self.metrics.snapshot()
+        snapshot["counters"]["requests.total"] = 99
+        snapshot["gauges"]["exporter.payload"]["labels"].append("mutated")
+        snapshot["histograms"]["response.time"]["count"] = 99
+
+        fresh = self.metrics.snapshot()
+        assert fresh["counters"]["requests.total"] == 1
+        assert fresh["gauges"]["exporter.payload"]["labels"] == ["worker"]
+        assert fresh["histograms"]["response.time"]["count"] == 1
 
 # 2019-07-16T09:29:21 update
 
