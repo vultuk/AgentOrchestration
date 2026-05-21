@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 from src.agent import AgentRegistry, AgentStatus
 from src.orchestrator.scheduler import TaskScheduler

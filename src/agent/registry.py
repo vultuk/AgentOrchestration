@@ -1,6 +1,5 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
 from enum import Enum

@@ -1,7 +1,7 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
 

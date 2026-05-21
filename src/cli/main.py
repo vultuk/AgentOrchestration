@@ -3,7 +3,6 @@
 import argparse
 import sys
 
-from src.common.config import Config
 from src.common.logging import configure_logging
 
 

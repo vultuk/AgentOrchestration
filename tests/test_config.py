@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 

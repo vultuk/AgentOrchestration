@@ -2,7 +2,7 @@
 
 import functools
 import asyncio
-from typing import Any, Callable, Dict, Optional
+from typing import Callable, Optional
 
 
 def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):

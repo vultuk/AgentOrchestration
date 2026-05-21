@@ -1,6 +1,5 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
 from typing import Any, Dict, Optional
