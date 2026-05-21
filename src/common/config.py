@@ -21,7 +21,16 @@ class Config:
         for key, value in os.environ.items():
             if key.startswith(prefix):
                 config_key = key[len(prefix):].lower().replace("_", ".")
-                self._set_nested(config_key, value)
+                self._set_nested(config_key, self._parse_env_value(value))
+
+    @staticmethod
+    def _parse_env_value(value: str) -> Any:
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+        return value
 
     def _set_nested(self, key: str, value: Any) -> None:
         parts = key.split(".")
