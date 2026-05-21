@@ -25,6 +25,22 @@ INTERNAL_FIELD_NAMES = {
     "token",
     "worker_pid",
 }
+INTERNAL_FIELD_CANONICALS = {
+    "".join(ch for ch in name if ch.isalnum())
+    for name in INTERNAL_FIELD_NAMES
+}
+INTERNAL_FIELD_PREFIXES = {
+    "agenttoken",
+    "attemptid",
+    "debugcontext",
+    "internal",
+    "privatestate",
+    "runid",
+    "sandboxpath",
+    "secret",
+    "token",
+    "workerpid",
+}
 
 DeliverFunc = Callable[[str, Dict[str, Any]], bool]
 
@@ -262,10 +278,16 @@ class WebhookRegistry:
 
     def _is_internal_field(self, key: str) -> bool:
         normalized = key.strip().lower()
+        compact = "".join(ch for ch in normalized if ch.isalnum())
         return (
             normalized in INTERNAL_FIELD_NAMES
+            or compact in INTERNAL_FIELD_CANONICALS
             or normalized.startswith("_")
             or normalized.startswith("internal_")
+            or any(
+                compact.startswith(prefix)
+                for prefix in INTERNAL_FIELD_PREFIXES
+            )
         )
 
     def _delivery_id(

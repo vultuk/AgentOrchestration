@@ -50,6 +50,38 @@ def test_valid_delivery_shapes_payload_before_transport_and_recording():
     )
 
 
+def test_sanitizer_removes_internal_metadata_aliases():
+    registry = WebhookRegistry()
+    shaped = registry.shape_public_event(
+        "task.completed",
+        "event-1",
+        {
+            "task_id": "task-1",
+            "runId": "run-camel",
+            "attempt-id": "attempt-dashed",
+            "workerPid": 42,
+            "agentTokenHash": "token-hash",
+            "secretValue": "secret-alias",
+            "internalTraceId": "trace-camel",
+            "result": {
+                "value": 7,
+                "privateState": "private-camel",
+                "visible": "public",
+            },
+        },
+    )
+
+    payload_text = str(shaped)
+    assert "run-camel" not in payload_text
+    assert "attempt-dashed" not in payload_text
+    assert "token-hash" not in payload_text
+    assert "secret-alias" not in payload_text
+    assert "trace-camel" not in payload_text
+    assert "private-camel" not in payload_text
+    assert shaped["payload"]["task_id"] == "task-1"
+    assert shaped["payload"]["result"] == {"value": 7, "visible": "public"}
+
+
 def test_rejects_unscoped_and_disabled_endpoint_delivery():
     registry = WebhookRegistry()
 
