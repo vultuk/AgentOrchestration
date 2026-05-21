@@ -5,7 +5,7 @@ import random
 import time
 from enum import Enum
 from threading import RLock
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -75,6 +75,7 @@ class TaskScheduler:
         self._states: Dict[str, TaskState] = {}
         self._attempts: Dict[str, int] = {}
         self._terminal_outcomes: Dict[str, Dict] = {}
+        self._runtime_records: Dict[str, List[Dict]] = {}
         self._lock = RLock()
         self._max_retries = max_retries
         self._base_retry_delay = base_retry_delay
@@ -115,6 +116,7 @@ class TaskScheduler:
             self._attempts[task_id] = 0
             task["attempt"] = 0
             self._transition(task_id, TaskState.SCHEDULED)
+            self._record_runtime_event("scheduled", task, TaskState.SCHEDULED)
             self._scheduled[task_id] = task
             return task_id
 
@@ -136,7 +138,17 @@ class TaskScheduler:
                     self._transition(task_id, TaskState.IN_FLIGHT)
                     self._in_flight[task_id] = task
                     task["started_at"] = self._clock()
+                    self._record_runtime_event(
+                        "started",
+                        task,
+                        TaskState.IN_FLIGHT,
+                    )
                     return task
+                self._record_runtime_event(
+                    "stale_queue_skipped",
+                    task,
+                    self._states.get(task_id),
+                )
                 task = self._queues[queue].pop()
             return None
 
@@ -172,6 +184,11 @@ class TaskScheduler:
                 task["scheduled_for"] = self._clock() + delay
                 task["queue"] = queue or task.get("queue", "default")
                 self._transition(task_id, TaskState.SCHEDULED)
+                self._record_runtime_event(
+                    "retry_scheduled",
+                    task,
+                    TaskState.SCHEDULED,
+                )
                 self._scheduled[task_id] = task
                 return True
 
@@ -202,6 +219,11 @@ class TaskScheduler:
             outcome = self._terminal_outcomes.get(task_id)
             return dict(outcome) if outcome else None
 
+    def runtime_records(self, task_id: str) -> List[Dict]:
+        with self._lock:
+            records = self._runtime_records.get(task_id, [])
+            return [dict(record) for record in records]
+
     def _push_current_attempt(
         self,
         task: Dict,
@@ -214,7 +236,9 @@ class TaskScheduler:
         task["attempt"] = self._attempts[task_id]
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
-        self._transition(task_id, TaskState.QUEUED)
+        if not self._transition(task_id, TaskState.QUEUED):
+            return
+        self._record_runtime_event("queued", task, TaskState.QUEUED)
         self._queues[queue].push(task, priority)
 
     def _promote_ready_tasks(self) -> None:
@@ -227,6 +251,11 @@ class TaskScheduler:
         for task_id in ready:
             task = self._scheduled.pop(task_id)
             if not self._is_current_attempt(task, TaskState.SCHEDULED):
+                self._record_runtime_event(
+                    "stale_schedule_skipped",
+                    task,
+                    self._states.get(task_id),
+                )
                 continue
             self._push_current_attempt(
                 task,
@@ -252,6 +281,28 @@ class TaskScheduler:
         jitter = delay * self._jitter_ratio
         return max(0.0, self._rng.uniform(delay - jitter, delay + jitter))
 
+    def _record_runtime_event(
+        self,
+        action: str,
+        task: Dict,
+        state: Optional[TaskState],
+    ) -> None:
+        task_id = task.get("id")
+        if not task_id:
+            return
+        records = self._runtime_records.setdefault(task_id, [])
+        records.append(
+            {
+                "action": action,
+                "state": state.value if state else "",
+                "at": self._clock(),
+                "queue": task.get("queue", "default"),
+                "priority": task.get("priority", 0),
+                "retries": task.get("retries", 0),
+                "attempt": task.get("attempt", self._attempts.get(task_id, 0)),
+            }
+        )
+
     def _record_terminal(
         self,
         task_id: str,
@@ -270,6 +321,7 @@ class TaskScheduler:
         }
         task["terminal_state"] = state.value
         task["finished_at"] = finished_at
+        self._record_runtime_event(state.value, task, state)
 
     def _transition(self, task_id: str, next_state: TaskState) -> bool:
         current_state = self._states.get(task_id)

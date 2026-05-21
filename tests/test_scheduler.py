@@ -82,6 +82,42 @@ class TestTaskScheduler:
         assert retry["attempt"] == 1
         assert retry["retries"] == 1
 
+    def test_retry_records_sanitized_runtime_decisions(self):
+        now = [250.0]
+        scheduler = TaskScheduler(
+            max_retries=1,
+            base_retry_delay=5,
+            jitter_ratio=0.0,
+            clock=lambda: now[0],
+            rng=random.Random(11),
+        )
+
+        task_id = scheduler.enqueue(
+            {
+                "type": "retry",
+                "payload": {"secret": "do-not-record"},
+            },
+            queue="critical",
+            priority=5,
+        )
+        task = asyncio.run(scheduler.dequeue(queue="critical"))
+        assert scheduler.fail(task["id"], error=TimeoutError("temporary"))
+
+        records = scheduler.runtime_records(task_id)
+        actions = [record["action"] for record in records]
+        assert actions == ["queued", "started", "retry_scheduled"]
+        assert records[-1]["queue"] == "critical"
+        assert records[-1]["priority"] == 5
+        assert records[-1]["retries"] == 1
+        assert records[-1]["attempt"] == 1
+        assert all("payload" not in record for record in records)
+        assert all("type" not in record for record in records)
+
+        records[-1]["action"] = "mutated"
+        assert scheduler.runtime_records(task_id)[-1]["action"] == (
+            "retry_scheduled"
+        )
+
     def test_stale_retry_attempt_cannot_overwrite_terminal_state(self):
         now = [300.0]
         scheduler = TaskScheduler(base_retry_delay=1, clock=lambda: now[0])
@@ -100,6 +136,33 @@ class TestTaskScheduler:
         assert asyncio.run(scheduler.dequeue()) is None
         assert scheduler.get_state(task_id) == TaskState.COMPLETED
         assert not scheduler.fail(task_id)
+
+    def test_terminal_outcome_leaves_no_stale_work_or_duplicate_record(self):
+        now = [350.0]
+        scheduler = TaskScheduler(max_retries=1, clock=lambda: now[0])
+
+        task_id = scheduler.enqueue({"type": "terminal-cleanup"})
+        asyncio.run(scheduler.dequeue())
+        assert scheduler.fail(task_id)
+
+        now[0] = scheduler._scheduled[task_id]["scheduled_for"] + 0.001
+        retry = asyncio.run(scheduler.dequeue())
+        assert retry["id"] == task_id
+        assert scheduler.complete(task_id)
+
+        assert task_id not in scheduler._scheduled
+        assert task_id not in scheduler._in_flight
+        assert scheduler.terminal_outcome(task_id)["state"] == "completed"
+        assert not scheduler.complete(task_id)
+        assert not scheduler.fail(task_id)
+        assert not scheduler.cancel(task_id)
+
+        terminal_records = [
+            record
+            for record in scheduler.runtime_records(task_id)
+            if record["state"] == "completed"
+        ]
+        assert len(terminal_records) == 1
 
     def test_retry_budget_records_single_failed_terminal_outcome(self):
         scheduler = TaskScheduler(max_retries=0)
