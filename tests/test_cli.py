@@ -10,9 +10,25 @@ def run_cli(monkeypatch, args):
     return cli()
 
 
-def test_logs_tail_rejects_negative_values(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    "tail_args",
+    [
+        ["--tail", "-5"],
+        ["-t", "-5"],
+    ],
+)
+def test_logs_tail_rejects_negative_values(monkeypatch, capsys, tail_args):
     with pytest.raises(SystemExit) as exc_info:
-        run_cli(monkeypatch, ["logs", "agent-1", "--tail", "-5"])
+        run_cli(monkeypatch, ["logs", "agent-1", *tail_args])
+
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "must be a non-negative integer" in captured.err
+
+
+def test_logs_tail_rejects_non_integer_values(monkeypatch, capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        run_cli(monkeypatch, ["logs", "agent-1", "--tail", "ten"])
 
     assert exc_info.value.code == 2
     captured = capsys.readouterr()
