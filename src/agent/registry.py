@@ -1,9 +1,10 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
+import copy
 import time
 import uuid
 from enum import Enum
+from threading import RLock
 from typing import Any, Dict, List, Optional
 
 
@@ -19,59 +20,97 @@ class AgentStatus(Enum):
 class AgentRegistry:
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
+        self._lock = RLock()
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
-        self._agents[agent_id] = {
-            "id": agent_id,
-            "name": name,
-            "type": agent_type,
-            "status": AgentStatus.PENDING.value,
-            "config": config or {},
-            "created_at": timestamp,
-            "updated_at": timestamp,
-            "version": "1.0.0",
-            "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
-        }
-        group = agent_type.split(".")[0]
-        if group not in self._index:
-            self._index[group] = []
-        self._index[group].append(agent_id)
+        with self._lock:
+            self._agents[agent_id] = {
+                "id": agent_id,
+                "name": name,
+                "type": agent_type,
+                "status": AgentStatus.PENDING.value,
+                "config": copy.deepcopy(config or {}),
+                "config_version": 1,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+                "version": "1.0.0",
+                "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
+            }
+            group = agent_type.split(".")[0]
+            if group not in self._index:
+                self._index[group] = []
+            self._index[group].append(agent_id)
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
-        return self._agents.get(agent_id)
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            return copy.deepcopy(agent) if agent is not None else None
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
-        agents = self._agents.values()
-        if status:
-            agents = [a for a in agents if a["status"] == status.value]
-        if group:
-            agent_ids = self._index.get(group, [])
-            agents = [a for a in agents if a["id"] in agent_ids]
-        return list(agents)
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        with self._lock:
+            agents = list(self._agents.values())
+            if status:
+                agents = [a for a in agents if a["status"] == status.value]
+            if group:
+                agent_ids = self._index.get(group, [])
+                agents = [a for a in agents if a["id"] in agent_ids]
+            return copy.deepcopy(agents)
 
     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
-        if agent_id not in self._agents:
-            return False
-        self._agents[agent_id]["status"] = status.value
-        self._agents[agent_id]["updated_at"] = time.time()
-        return True
+        with self._lock:
+            if agent_id not in self._agents:
+                return False
+            self._agents[agent_id]["status"] = status.value
+            self._agents[agent_id]["updated_at"] = time.time()
+            return True
+
+    def update_config(
+        self,
+        agent_id: str,
+        config: Dict[str, Any],
+        expected_version: int,
+    ) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if agent is None:
+                return None
+
+            current_version = int(agent.get("config_version", 1))
+            if current_version != expected_version:
+                return None
+
+            agent["config"] = copy.deepcopy(config)
+            agent["config_version"] = current_version + 1
+            agent["updated_at"] = time.time()
+            return copy.deepcopy(agent)
 
     def delete(self, agent_id: str) -> bool:
-        if agent_id not in self._agents:
-            return False
-        agent = self._agents.pop(agent_id)
-        group = agent["type"].split(".")[0]
-        if group in self._index and agent_id in self._index[group]:
-            self._index[group].remove(agent_id)
-        return True
+        with self._lock:
+            if agent_id not in self._agents:
+                return False
+            agent = self._agents.pop(agent_id)
+            group = agent["type"].split(".")[0]
+            if group in self._index and agent_id in self._index[group]:
+                self._index[group].remove(agent_id)
+            return True
 
     def count(self) -> int:
-        return len(self._agents)
+        with self._lock:
+            return len(self._agents)
 
 # 2019-01-29T11:24:49 update
 

@@ -1,22 +1,36 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+import json
+from typing import Dict, Optional
+
+from fastapi import APIRouter, HTTPException, Request, Response
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.agent_config import (
+    AgentConfigError,
+    read_agent_config,
+    update_agent_config,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -34,6 +48,61 @@ async def delete_agent(agent_id: str):
     if not registry.delete(agent_id):
         raise HTTPException(status_code=404, detail="Agent not found")
     return {"status": "deleted"}
+
+
+def _raise_config_error(error: AgentConfigError) -> None:
+    raise HTTPException(status_code=error.status_code, detail=error.detail)
+
+
+@router.get("/agents/{agent_id}/config")
+async def get_agent_config(agent_id: str, response: Response):
+    try:
+        result = read_agent_config(registry, agent_id)
+    except AgentConfigError as error:
+        _raise_config_error(error)
+
+    response.headers["ETag"] = result["etag"]
+    return {
+        "agent_id": result["agent_id"],
+        "config": result["config"],
+        "config_version": result["version"],
+    }
+
+
+@router.put("/agents/{agent_id}/config")
+@router.patch("/agents/{agent_id}/config")
+async def set_agent_config(
+    agent_id: str,
+    request: Request,
+    response: Response,
+):
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        _raise_config_error(
+            AgentConfigError(
+                400,
+                "malformed_json",
+                "request body must be valid JSON",
+            )
+        )
+
+    try:
+        result = update_agent_config(
+            registry,
+            agent_id,
+            payload,
+            request.headers.get("if-match"),
+        )
+    except AgentConfigError as error:
+        _raise_config_error(error)
+
+    response.headers["ETag"] = result["etag"]
+    return {
+        "agent_id": result["agent_id"],
+        "config": result["config"],
+        "config_version": result["version"],
+    }
 
 
 @router.post("/agents/{agent_id}/start")
