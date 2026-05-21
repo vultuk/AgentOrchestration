@@ -6,15 +6,22 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from .checkpoints import CheckpointRecord, CheckpointStore
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
 
 
 class OrchestrationEngine:
-    def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
+    def __init__(
+        self,
+        max_workers: int = 10,
+        agent_timeout: int = 300,
+        checkpoint_store: Optional[CheckpointStore] = None,
+    ):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
+        self.checkpoints = checkpoint_store or CheckpointStore()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
@@ -41,6 +48,35 @@ class OrchestrationEngine:
     def stop(self) -> None:
         self._running = False
         logger.info("Orchestration engine stopped")
+
+    def save_checkpoint(
+        self,
+        task: Dict[str, Any],
+        step_id: str,
+        payload: Any,
+        attempt: Optional[int] = None,
+    ) -> CheckpointRecord:
+        checkpoint_attempt = attempt
+        if checkpoint_attempt is None:
+            checkpoint_attempt = int(
+                task.get("attempt", task.get("retries", 0)),
+            )
+        return self.checkpoints.write(
+            task_id=str(task["id"]),
+            step_id=step_id,
+            attempt=checkpoint_attempt,
+            payload=payload,
+        )
+
+    def resume_checkpoint(
+        self,
+        task_id: str,
+        step_id: str,
+        attempt: Optional[int] = None,
+    ) -> Optional[CheckpointRecord]:
+        if attempt is not None:
+            return self.checkpoints.get(task_id, step_id, attempt)
+        return self.checkpoints.latest_for_step(task_id, step_id)
 
     async def _execute_task(self, task: Dict[str, Any]) -> None:
         task_id = task["id"]
@@ -82,7 +118,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 

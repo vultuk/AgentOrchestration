@@ -1,10 +1,17 @@
 """Orchestration engine module."""
 
+from .checkpoints import CheckpointDigestMismatchError, CheckpointStore
 from .engine import OrchestrationEngine
 from .scheduler import TaskScheduler
 from .workflow import WorkflowManager
 
-__all__ = ["OrchestrationEngine", "TaskScheduler", "WorkflowManager"]
+__all__ = [
+    "CheckpointDigestMismatchError",
+    "CheckpointStore",
+    "OrchestrationEngine",
+    "TaskScheduler",
+    "WorkflowManager",
+]
 
 # 2019-07-01T16:04:27 update
 
