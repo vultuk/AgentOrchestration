@@ -1,10 +1,18 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
+import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+from src.common.metrics import metrics
+from src.orchestrator.artifact_retention import (
+    ArtifactRetentionPolicyValidator,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class PriorityQueue:
@@ -33,34 +41,85 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._artifact_cleanup_bindings: Dict[str, str] = {}
+        self._audit_records: List[Dict[str, Any]] = []
+        self._artifact_retention_validator = ArtifactRetentionPolicyValidator()
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        decision = self._validate_artifact_cleanup(task)
+        artifact_id = decision.artifact_id if decision.allowed else None
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
 
+        if artifact_id:
+            self._bind_artifact_cleanup(artifact_id, task_id)
+            self._audit("cleanup_queued", task_id, decision)
+            metrics.increment("artifact_retention.cleanup_queued")
+
+        self._put_queue(task, queue, priority)
+        return task_id
+
+    def _put_queue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> None:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        decision = self._validate_artifact_cleanup(task)
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["scheduled_at"] = time.time()
+        task["scheduled_for"] = task["scheduled_at"] + delay
+        task["retries"] = task.get("retries", 0)
+        self._scheduled[task_id] = {
+            "task": task,
+            "due_at": task["scheduled_for"],
+            "queue": queue,
+            "priority": priority,
+        }
+        if decision.artifact_id:
+            self._bind_artifact_cleanup(decision.artifact_id, task_id)
+            self._audit("cleanup_scheduled", task_id, decision)
+            metrics.increment("artifact_retention.cleanup_scheduled")
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid
+            for tid, item in self._scheduled.items()
+            if item["due_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
+            item = self._scheduled.pop(tid)
+            task = item["task"]
             if task:
-                self.enqueue(task, queue)
+                self._put_queue(task, item["queue"], item["priority"])
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -70,16 +129,90 @@ class TaskScheduler:
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        task = self._in_flight.pop(task_id, None)
+        if task is None:
+            return False
+        self._release_artifact_cleanup(task_id)
+        return True
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self._put_queue(task, queue, priority=task.get("priority", 0))
                 return True
+            self._release_artifact_cleanup(task_id)
         return False
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._audit_records]
+
+    def _validate_artifact_cleanup(self, task: Dict) -> Any:
+        decision = (
+            self._artifact_retention_validator.validate_cleanup_schedule(task)
+        )
+        if not decision.allowed:
+            self._audit("cleanup_rejected", None, decision)
+            metrics.increment(
+                f"artifact_retention.cleanup_rejected.{decision.reason}"
+            )
+            logger.warning(
+                "artifact cleanup scheduling rejected: %s",
+                decision.audit_context(),
+            )
+            raise ValueError(f"artifact cleanup rejected: {decision.reason}")
+
+        if (
+            decision.artifact_id
+            and decision.artifact_id in self._artifact_cleanup_bindings
+        ):
+            duplicate = decision.__class__(
+                False,
+                "reject",
+                "duplicate-cleanup-scheduled",
+                decision.artifact_id,
+                decision.lifecycle_state,
+            )
+            self._audit("cleanup_rejected", None, duplicate)
+            metrics.increment(
+                "artifact_retention.cleanup_rejected."
+                "duplicate-cleanup-scheduled"
+            )
+            logger.warning(
+                "artifact cleanup scheduling rejected: %s",
+                duplicate.audit_context(),
+            )
+            raise ValueError(
+                "artifact cleanup rejected: duplicate-cleanup-scheduled"
+            )
+        return decision
+
+    def _bind_artifact_cleanup(self, artifact_id: str, task_id: str) -> None:
+        self._artifact_cleanup_bindings[artifact_id] = task_id
+
+    def _release_artifact_cleanup(self, task_id: str) -> None:
+        for artifact_id, bound_task_id in list(
+            self._artifact_cleanup_bindings.items()
+        ):
+            if bound_task_id == task_id:
+                del self._artifact_cleanup_bindings[artifact_id]
+
+    def _audit(
+        self,
+        event: str,
+        task_id: Optional[str],
+        decision: Any,
+    ) -> None:
+        record = {
+            "event": event,
+            "task_id": task_id,
+            "reason": decision.reason,
+            "artifact_ref": decision.artifact_ref(),
+            "lifecycle_state": decision.lifecycle_state,
+            "timestamp": time.time(),
+        }
+        self._audit_records.append(record)
 
 # 2019-04-25T08:37:12 update
 
