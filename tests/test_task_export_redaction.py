@@ -20,6 +20,7 @@ def _task_record():
     return {
         "id": "task-1",
         "type": "download",
+        "target_agent": "agent-1",
         "queue": "exports",
         "priority": 5,
         "status": "queued",
@@ -41,6 +42,12 @@ def _task_record():
             "region": "eu",
         },
         "error": "connection failed with raw-token",
+        "internal_metadata": {
+            "worker_pid": 123,
+            "host": "runner-1",
+        },
+        "debug_context": "raw-token stack context",
+        "worker_pid": 123,
     }
 
 
@@ -65,12 +72,17 @@ def test_json_csv_and_ui_exports_share_redaction_policy():
     assert "client_secret" not in exported["metadata"]
     assert exported["config"]["api_key"] == MASKED_VALUE
     assert exported["error"] == MASKED_VALUE
+    assert exported["target_agent"] == "agent-1"
+    assert "internal_metadata" not in exported
+    assert "debug_context" not in exported
+    assert "worker_pid" not in exported
 
     restricted_values = (
         "raw-token",
         "raw-password",
         "raw-secret",
         "raw-api-key",
+        "runner-1",
     )
     for restricted in restricted_values:
         assert restricted not in csv_text

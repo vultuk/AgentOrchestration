@@ -31,6 +31,7 @@ class FieldClassification(str, Enum):
 TASK_EXPORT_FIELD_POLICY: Mapping[str, FieldClassification] = {
     "id": FieldClassification.PUBLIC,
     "type": FieldClassification.PUBLIC,
+    "target_agent": FieldClassification.PUBLIC,
     "queue": FieldClassification.PUBLIC,
     "priority": FieldClassification.PUBLIC,
     "status": FieldClassification.PUBLIC,
@@ -44,6 +45,13 @@ TASK_EXPORT_FIELD_POLICY: Mapping[str, FieldClassification] = {
     "config": FieldClassification.NESTED,
     "result": FieldClassification.NESTED,
     "error": FieldClassification.MASKED,
+    "debug_context": FieldClassification.OMITTED,
+    "handler": FieldClassification.OMITTED,
+    "internal_metadata": FieldClassification.OMITTED,
+    "internal_trace": FieldClassification.OMITTED,
+    "sandbox_path": FieldClassification.OMITTED,
+    "stack": FieldClassification.OMITTED,
+    "worker_pid": FieldClassification.OMITTED,
 }
 
 RESTRICTED_FIELD_POLICY: Mapping[str, FieldClassification] = {
