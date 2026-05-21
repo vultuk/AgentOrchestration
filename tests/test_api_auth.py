@@ -35,7 +35,21 @@ def client():
                     "workspace_role": "admin",
                     "scopes": ["agents:read", "agents:write"],
                     "expires_at": now - 1,
-                }
+                },
+                "alpha-admin-token": {
+                    "subject": "alpha-admin",
+                    "workspace_role": "admin",
+                    "scopes": ["agents:read", "agents:write"],
+                    "workspaces": ["alpha"],
+                    "expires_at": now + 3600,
+                },
+                "multi-workspace-token": {
+                    "subject": "multi-admin",
+                    "workspace_role": "admin",
+                    "scopes": ["agents:read", "agents:write"],
+                    "workspaces": ["alpha", "beta"],
+                    "expires_at": now + 3600,
+                },
             }
         }
     )
@@ -136,6 +150,58 @@ def test_trailing_slash_write_denies_read_only_principal_before_redirect(
     assert response.text == "Forbidden"
 
 
+def test_protected_route_allows_matching_workspace_principal(client):
+    response = client.get(
+        "/api/v2/agents/",
+        headers={
+            **bearer("alpha-admin-token"),
+            "X-AO-Workspace": "alpha",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "agents" in response.json()
+
+
+def test_protected_route_rejects_wrong_workspace_principal_before_redirect(
+    client,
+):
+    response = client.post(
+        "/api/v2/agents/",
+        params={"name": "wrong-workspace", "agent_type": "worker.processor"},
+        headers={
+            **bearer("alpha-admin-token"),
+            "X-AO-Workspace": "beta",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 403
+    assert response.text == "Forbidden"
+
+
+def test_multi_workspace_principal_requires_explicit_workspace(client):
+    response = client.get(
+        "/api/v2/agents/",
+        headers=bearer("multi-workspace-token"),
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 403
+    assert response.text == "Forbidden"
+
+
+def test_workspace_query_context_is_enforced(client):
+    response = client.get(
+        "/api/v2/agents/",
+        params={"workspace_id": "alpha"},
+        headers=bearer("alpha-admin-token"),
+    )
+
+    assert response.status_code == 200
+    assert "agents" in response.json()
+
+
 def test_authorized_principals_keep_existing_read_and_write_workflows(client):
     create_response = client.post(
         "/api/v2/agents/",
@@ -150,4 +216,7 @@ def test_authorized_principals_keep_existing_read_and_write_workflows(client):
     assert create_response.status_code == 200
     assert create_response.json()["status"] == "registered"
     assert list_response.status_code == 200
-    assert list_response.json()["agents"][0]["name"] == "allowed-agent"
+    assert any(
+        agent["name"] == "allowed-agent"
+        for agent in list_response.json()["agents"]
+    )

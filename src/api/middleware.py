@@ -25,6 +25,8 @@ class AuthPrincipal:
     subject: str
     workspace_role: str
     scopes: frozenset[str]
+    workspaces: frozenset[str]
+    workspace: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,7 @@ class TokenRecord:
     subject: str
     workspace_role: str
     scopes: frozenset[str]
+    workspaces: frozenset[str]
     revoked: bool = False
     expires_at: Optional[float] = None
 
@@ -56,6 +59,7 @@ class TokenAuthorizer:
         session_token: Optional[str],
         required_scope: str,
         allowed_roles: Set[str],
+        workspace: Optional[str] = None,
     ) -> AuthPrincipal:
         token = self._extract_request_token(authorization, session_token)
         record = self._tokens.get(token)
@@ -71,10 +75,13 @@ class TokenAuthorizer:
             raise AuthError(403, "Forbidden")
         if record.workspace_role not in allowed_roles:
             raise AuthError(403, "Forbidden")
+        resolved_workspace = self._authorize_workspace(record, workspace)
         return AuthPrincipal(
             record.subject,
             record.workspace_role,
             record.scopes,
+            record.workspaces,
+            resolved_workspace,
         )
 
     @classmethod
@@ -108,6 +115,38 @@ class TokenAuthorizer:
         return token
 
     @classmethod
+    def _authorize_workspace(
+        cls,
+        record: TokenRecord,
+        requested_workspace: Optional[str],
+    ) -> Optional[str]:
+        if "*" in record.workspaces:
+            return requested_workspace
+        if requested_workspace:
+            if requested_workspace not in record.workspaces:
+                raise AuthError(403, "Forbidden")
+            return requested_workspace
+        if len(record.workspaces) == 1:
+            return next(iter(record.workspaces))
+        raise AuthError(403, "Forbidden")
+
+    @classmethod
+    def _normalize_workspaces(cls, raw_record: dict) -> frozenset[str]:
+        raw_workspaces = raw_record.get("workspaces")
+        if raw_workspaces is None:
+            raw_workspaces = raw_record.get("workspace")
+        if raw_workspaces is None:
+            return frozenset({"*"})
+        if isinstance(raw_workspaces, str):
+            raw_workspaces = [raw_workspaces]
+        workspaces = frozenset(
+            str(workspace).strip()
+            for workspace in raw_workspaces
+            if str(workspace).strip()
+        )
+        return workspaces or frozenset({"*"})
+
+    @classmethod
     def _normalize_tokens(
         cls,
         tokens: Union[dict, list],
@@ -130,6 +169,7 @@ class TokenAuthorizer:
                 subject=raw_record.get("subject", "api-client"),
                 workspace_role=raw_record.get("workspace_role", "admin"),
                 scopes=scopes,
+                workspaces=cls._normalize_workspaces(raw_record),
                 revoked=bool(raw_record.get("revoked", False)),
                 expires_at=raw_record.get("expires_at"),
             )
@@ -164,6 +204,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     request.cookies.get(self.session_cookie_name),
                     required_scope,
                     allowed_roles,
+                    self._requested_workspace(request),
                 )
             except AuthError as exc:
                 return Response(
@@ -197,6 +238,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
     @staticmethod
     def _is_protected_api_path(path: str) -> bool:
         return path == "/api/v2" or path.startswith("/api/v2/")
+
+    @staticmethod
+    def _requested_workspace(request: Request) -> Optional[str]:
+        for value in (
+            request.headers.get("X-AO-Workspace"),
+            request.query_params.get("workspace"),
+            request.query_params.get("workspace_id"),
+        ):
+            if value and value.strip():
+                return value.strip()
+        return None
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
