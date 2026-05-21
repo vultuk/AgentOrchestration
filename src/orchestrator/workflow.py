@@ -1,8 +1,14 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import hashlib
+import logging
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+from src.common.metrics import MetricsCollector, metrics
+
+logger = logging.getLogger(__name__)
 
 
 class StepStatus(Enum):
@@ -14,12 +20,26 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        branch_id: Optional[str] = None,
+        join_id: Optional[str] = None,
+        output_namespace: Optional[str] = None,
+        output_keys: Optional[List[str]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.branch_id = branch_id
+        self.join_id = join_id
+        self.output_namespace = output_namespace
+        self.output_keys = tuple(output_keys or [])
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -32,6 +52,8 @@ class Workflow:
         self.description = description
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
+        self.outputs: Dict[str, Dict[str, Any]] = {}
+        self.validation_errors: List[Dict[str, Any]] = []
         self.status = StepStatus.PENDING
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
@@ -44,8 +66,10 @@ class Workflow:
 
 
 class WorkflowManager:
-    def __init__(self):
+    def __init__(self, metrics_collector: Optional[MetricsCollector] = None):
         self._workflows: Dict[str, Workflow] = {}
+        self.metrics = metrics_collector or metrics
+        self._audit_records: List[Dict[str, Any]] = []
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
@@ -61,17 +85,31 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._audit_records]
+
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
 
+        validation_errors = self._validate_branch_output_namespaces(workflow)
+        if validation_errors:
+            workflow.validation_errors = validation_errors
+            workflow.status = StepStatus.FAILED
+            for error in validation_errors:
+                self._record_output_namespace_rejection(workflow, error)
+            return False
+
+        workflow.validation_errors = []
+        workflow.outputs = {}
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
             try:
                 result = step.handler()
                 step.result = result
+                self._merge_step_output(workflow, step, result)
                 step.status = StepStatus.COMPLETED
             except Exception as e:
                 step.error = str(e)
@@ -81,6 +119,117 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _validate_branch_output_namespaces(
+        self,
+        workflow: Workflow,
+    ) -> List[Dict[str, Any]]:
+        errors: List[Dict[str, Any]] = []
+        seen_namespaces: Dict[tuple, WorkflowStep] = {}
+        for step in workflow.steps:
+            if not step.join_id:
+                continue
+            if not step.branch_id:
+                errors.append(
+                    self._validation_error(
+                        step,
+                        "missing_branch_id",
+                    ),
+                )
+                continue
+            if not step.output_namespace:
+                errors.append(
+                    self._validation_error(
+                        step,
+                        "missing_output_namespace",
+                    ),
+                )
+                continue
+
+            namespace_key = (step.join_id, step.output_namespace)
+            existing = seen_namespaces.get(namespace_key)
+            if existing and existing.branch_id != step.branch_id:
+                errors.append(
+                    self._validation_error(
+                        step,
+                        "duplicate_output_namespace",
+                        existing,
+                    ),
+                )
+                continue
+            seen_namespaces[namespace_key] = step
+        return errors
+
+    @staticmethod
+    def _validation_error(
+        step: WorkflowStep,
+        reason: str,
+        conflicting_step: Optional[WorkflowStep] = None,
+    ) -> Dict[str, Any]:
+        error = {
+            "reason": reason,
+            "step_id": step.id,
+            "branch_id": step.branch_id,
+            "join_id": step.join_id,
+            "output_namespace": step.output_namespace,
+        }
+        if conflicting_step:
+            error["conflicting_step_id"] = conflicting_step.id
+            error["conflicting_branch_id"] = conflicting_step.branch_id
+        return error
+
+    def _record_output_namespace_rejection(
+        self,
+        workflow: Workflow,
+        error: Dict[str, Any],
+    ) -> None:
+        reason = error["reason"]
+        record = {
+            "decision": "rejected",
+            "reason": reason,
+            "workflow_ref": self._safe_ref(workflow.id),
+            "step_ref": self._safe_ref(error.get("step_id")),
+            "branch_ref": self._safe_ref(error.get("branch_id")),
+            "join_ref": self._safe_ref(error.get("join_id")),
+            "namespace_ref": self._safe_ref(error.get("output_namespace")),
+            "conflicting_step_ref": self._safe_ref(
+                error.get("conflicting_step_id"),
+            ),
+            "conflicting_branch_ref": self._safe_ref(
+                error.get("conflicting_branch_id"),
+            ),
+        }
+        self._audit_records.append(record)
+        self.metrics.increment(f"workflow.output_merger.rejected.{reason}")
+        logger.warning(
+            "Rejected workflow branch output binding workflow_ref=%s "
+            "step_ref=%s reason=%s",
+            record["workflow_ref"],
+            record["step_ref"],
+            reason,
+        )
+
+    @staticmethod
+    def _merge_step_output(
+        workflow: Workflow,
+        step: WorkflowStep,
+        result: Any,
+    ) -> None:
+        if not step.output_namespace:
+            return
+        namespace = workflow.outputs.setdefault(step.output_namespace, {})
+        if step.output_keys and isinstance(result, dict):
+            for key in step.output_keys:
+                namespace[key] = result.get(key)
+            return
+        namespace[step.name] = result
+
+    @staticmethod
+    def _safe_ref(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        digest = hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+        return digest[:16]
 
 # 2019-03-27T19:58:07 update
 
