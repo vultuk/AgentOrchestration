@@ -1,6 +1,7 @@
 """Orchestration Engine — Core execution and coordination logic."""
 
 import asyncio
+import inspect
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
@@ -11,7 +12,15 @@ from src.orchestrator.scheduler import TaskScheduler
 logger = logging.getLogger(__name__)
 
 
+class PluginManifestError(ValueError):
+    """Raised when a plugin manifest is unsafe to load."""
+
+
 class OrchestrationEngine:
+    HOOK_EVENTS = frozenset(
+        {"pre_execute", "post_execute", "on_error", "on_complete"}
+    )
+
     def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
@@ -24,10 +33,51 @@ class OrchestrationEngine:
             "on_error": [],
             "on_complete": [],
         }
+        self._active_task_ids = set()
+        self._task_outcomes: Dict[str, Dict[str, Any]] = {}
+        self._state_lock = asyncio.Lock()
 
     def register_hook(self, event: str, callback: Callable) -> None:
-        if event in self._hooks:
-            self._hooks[event].append(callback)
+        self._validate_hook(event, callback)
+        self._hooks[event].append(callback)
+
+    def validate_plugin_manifest(
+        self,
+        manifest: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not isinstance(manifest, dict):
+            raise PluginManifestError("plugin manifest must be an object")
+
+        name = manifest.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise PluginManifestError(
+                "plugin manifest requires a non-empty name"
+            )
+
+        hooks = manifest.get("hooks", [])
+        if not isinstance(hooks, list):
+            raise PluginManifestError("plugin manifest hooks must be a list")
+
+        for index, hook in enumerate(hooks):
+            if not isinstance(hook, dict):
+                raise PluginManifestError(
+                    f"plugin hook #{index} must be an object"
+                )
+            if hook.get("enabled", True) is False:
+                continue
+            self._validate_hook(hook.get("event"), hook.get("callback"))
+
+        return manifest
+
+    def load_plugin_manifest(self, manifest: Dict[str, Any]) -> None:
+        self.validate_plugin_manifest(manifest)
+        for hook in manifest.get("hooks", []):
+            if hook.get("enabled", True) is not False:
+                self.register_hook(hook["event"], hook["callback"])
+
+    def get_task_outcome(self, task_id: str) -> Optional[Dict[str, Any]]:
+        outcome = self._task_outcomes.get(task_id)
+        return dict(outcome) if outcome else None
 
     async def start(self) -> None:
         self._running = True
@@ -47,10 +97,20 @@ class OrchestrationEngine:
         agent_id = task["target_agent"]
         logger.info(f"Executing task {task_id} on agent {agent_id}")
 
-        for hook in self._hooks["pre_execute"]:
-            await hook(task)
+        if not await self._begin_task(task_id):
+            logger.warning(
+                f"Task {task_id} already has an active or terminal execution"
+            )
+            return
 
         try:
+            manifest = task.get("plugin_manifest")
+            if manifest is not None:
+                self.validate_plugin_manifest(manifest)
+
+            for hook in self._hooks["pre_execute"]:
+                await self._call_hook(hook, task)
+
             agent = self.registry.get(agent_id)
             if not agent:
                 raise ValueError(f"Agent {agent_id} not found")
@@ -63,14 +123,48 @@ class OrchestrationEngine:
             self.registry.update_status(agent_id, AgentStatus.PAUSED)
 
             for hook in self._hooks["post_execute"]:
-                await hook(task, result)
+                await self._call_hook(hook, task, result)
 
+            await self._record_task_outcome(
+                task_id,
+                "completed",
+                result=result,
+            )
+            self.scheduler.complete(task_id)
             logger.info(f"Task {task_id} completed successfully")
 
+        except asyncio.CancelledError:
+            self.registry.update_status(agent_id, AgentStatus.FAILED)
+            self.scheduler.discard(task_id)
+            await self._record_task_outcome(task_id, "cancelled")
+            raise
+        except PluginManifestError as e:
+            self.registry.update_status(agent_id, AgentStatus.FAILED)
+            self.scheduler.discard(task_id)
+            await self._record_task_outcome(
+                task_id,
+                "failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            logger.error(
+                f"Task {task_id} rejected before plugin hooks loaded: {e}"
+            )
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}")
+            self.registry.update_status(agent_id, AgentStatus.FAILED)
+            retry_scheduled = self.scheduler.fail(task_id)
+            if not retry_scheduled:
+                await self._record_task_outcome(
+                    task_id,
+                    "failed",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
             for hook in self._hooks["on_error"]:
-                await hook(task, e)
+                await self._call_hook(hook, task, e)
+        finally:
+            await self._end_task(task_id)
 
     async def _run_agent_task(self, agent: Dict, task: Dict) -> Any:
         loop = asyncio.get_event_loop()
@@ -82,7 +176,55 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
+
+    def _validate_hook(self, event: Any, callback: Any) -> None:
+        if event not in self.HOOK_EVENTS:
+            raise PluginManifestError(
+                f"unsupported plugin hook event: {event!r}"
+            )
+        if not callable(callback):
+            raise PluginManifestError(
+                f"plugin hook {event!r} requires a callable"
+            )
+
+    async def _call_hook(self, hook: Callable, *args: Any) -> None:
+        result = hook(*args)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _begin_task(self, task_id: str) -> bool:
+        async with self._state_lock:
+            if (
+                task_id in self._task_outcomes
+                or task_id in self._active_task_ids
+            ):
+                return False
+            self._active_task_ids.add(task_id)
+            return True
+
+    async def _end_task(self, task_id: str) -> None:
+        async with self._state_lock:
+            self._active_task_ids.discard(task_id)
+
+    async def _record_task_outcome(
+        self,
+        task_id: str,
+        status: str,
+        **fields: Any,
+    ) -> bool:
+        async with self._state_lock:
+            if task_id in self._task_outcomes:
+                return False
+            self._task_outcomes[task_id] = {
+                "task_id": task_id,
+                "status": status,
+                **fields,
+            }
+            return True
 
 # 2019-04-24T14:55:39 update
 
