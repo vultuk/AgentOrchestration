@@ -17,6 +17,7 @@ SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
 }
+ERROR_SANITIZED_HEADER = "X-Error-Sanitized"
 
 REQUEST_STATE_KEYS = (
     "auth_context",
@@ -60,12 +61,12 @@ class ExceptionSecurityMiddleware(BaseHTTPMiddleware):
                 request.url.path,
                 request.method,
             )
-            return apply_security_headers(
-                JSONResponse(
-                    status_code=500,
-                    content={"detail": "Internal server error"},
-                ),
+            response = JSONResponse(
+                status_code=500,
+                content={"detail": "Internal server error"},
             )
+            response.headers[ERROR_SANITIZED_HEADER] = "true"
+            return apply_security_headers(response)
         finally:
             clear_request_state(request)
 

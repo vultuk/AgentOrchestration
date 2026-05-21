@@ -3,7 +3,7 @@ import logging
 from fastapi import Request
 from fastapi.testclient import TestClient
 
-from src.api.middleware import SECURITY_HEADERS
+from src.api.middleware import ERROR_SANITIZED_HEADER, SECURITY_HEADERS
 from src.api.server import create_app
 
 
@@ -61,9 +61,26 @@ def test_exception_response_is_sanitized_and_has_security_headers(caplog):
 
     assert response.status_code == 500
     assert response.json() == {"detail": "Internal server error"}
+    assert response.headers[ERROR_SANITIZED_HEADER] == "true"
     assert_security_headers(response)
     assert "super-secret-token" not in response.text
     assert "super-secret-token" not in caplog.text
+    assert "Authorization" not in caplog.text
+    assert "token=" not in caplog.text
+
+
+def test_security_headers_are_added_to_rate_limit_responses():
+    client = build_test_client()
+    headers = {"Authorization": "Bearer test-token"}
+
+    for _ in range(100):
+        ok_response = client.get("/api/v2/security-ok", headers=headers)
+        assert ok_response.status_code == 200
+    response = client.get("/api/v2/security-ok", headers=headers)
+
+    assert response.status_code == 429
+    assert response.text == "Too many requests"
+    assert_security_headers(response)
 
 
 def test_request_state_is_cleared_after_exception_path():
