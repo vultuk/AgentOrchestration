@@ -1,8 +1,41 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
+import re
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 from uuid import uuid4
+
+from src.common.metrics import metrics
+
+logger = logging.getLogger(__name__)
+
+_DURATION_PATTERN = re.compile(
+    r"^\s*(?P<value>\d+(?:\.\d+)?)\s*"
+    r"(?P<unit>ms|s|sec|secs|m|min|mins|h|hr|hrs)\s*$",
+)
+_TIMEOUT_UNITS = {
+    "timeout": 1.0,
+    "timeout_seconds": 1.0,
+    "timeout_sec": 1.0,
+    "timeout_minutes": 60.0,
+    "timeout_min": 60.0,
+    "timeout_ms": 0.001,
+    "timeout_milliseconds": 0.001,
+}
+_NESTED_TIMEOUT_UNITS = {
+    "milliseconds": 0.001,
+    "ms": 0.001,
+    "seconds": 1.0,
+    "second": 1.0,
+    "sec": 1.0,
+    "minutes": 60.0,
+    "minute": 60.0,
+    "min": 60.0,
+    "hours": 3600.0,
+    "hour": 3600.0,
+    "hr": 3600.0,
+}
 
 
 class StepStatus(Enum):
@@ -13,8 +46,121 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class WorkflowDefinitionError(ValueError):
+    """Raised when workflow timing data is unsafe to register or dispatch."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _provided_keys(
+    definition: Mapping[str, Any],
+    allowed: Mapping[str, float],
+) -> List[str]:
+    return [
+        key for key in allowed
+        if key in definition and definition[key] is not None
+    ]
+
+
+def parse_timeout_duration(
+    definition: Mapping[str, Any],
+    default: float = 300.0,
+) -> float:
+    """Parse one timeout representation into seconds.
+
+    Definitions may use one timeout unit only. Accepting multiple unit fields
+    can silently change execution policy, so conflicting units are rejected
+    before a workflow can be registered or dispatched.
+    """
+
+    keys = _provided_keys(definition, _TIMEOUT_UNITS)
+    if not keys:
+        return float(default)
+
+    if len(keys) > 1:
+        raise WorkflowDefinitionError(
+            "conflicting_timeout_units",
+            "workflow step defines multiple timeout units",
+        )
+
+    key = keys[0]
+    raw_value = definition[key]
+    if key == "timeout" and isinstance(raw_value, Mapping):
+        nested_keys = _provided_keys(raw_value, _NESTED_TIMEOUT_UNITS)
+        if len(nested_keys) != 1:
+            raise WorkflowDefinitionError(
+                "conflicting_timeout_units",
+                "workflow step timeout mapping must define exactly one unit",
+            )
+        nested_key = nested_keys[0]
+        return _positive_seconds(
+            raw_value[nested_key],
+            _NESTED_TIMEOUT_UNITS[nested_key],
+        )
+
+    if key == "timeout" and isinstance(raw_value, str):
+        return _parse_duration_string(raw_value)
+
+    return _positive_seconds(raw_value, _TIMEOUT_UNITS[key])
+
+
+def _parse_duration_string(value: str) -> float:
+    match = _DURATION_PATTERN.match(value)
+    if not match:
+        raise WorkflowDefinitionError(
+            "invalid_timeout",
+            "workflow step timeout string must include a supported unit",
+        )
+
+    amount = float(match.group("value"))
+    unit = match.group("unit")
+    multiplier = {
+        "ms": 0.001,
+        "s": 1.0,
+        "sec": 1.0,
+        "secs": 1.0,
+        "m": 60.0,
+        "min": 60.0,
+        "mins": 60.0,
+        "h": 3600.0,
+        "hr": 3600.0,
+        "hrs": 3600.0,
+    }[unit]
+    return _positive_seconds(amount, multiplier)
+
+
+def _positive_seconds(value: Any, multiplier: float) -> float:
+    if isinstance(value, bool):
+        raise WorkflowDefinitionError(
+            "invalid_timeout",
+            "workflow step timeout must be numeric",
+        )
+    try:
+        seconds = float(value) * multiplier
+    except (TypeError, ValueError):
+        raise WorkflowDefinitionError(
+            "invalid_timeout",
+            "workflow step timeout must be numeric",
+        )
+
+    if seconds <= 0:
+        raise WorkflowDefinitionError(
+            "invalid_timeout",
+            "workflow step timeout must be positive",
+        )
+    return seconds
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: float = 300.0,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -46,9 +192,74 @@ class Workflow:
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self._audit_log: List[Dict[str, Any]] = []
+
+    @property
+    def audit_decisions(self) -> List[Dict[str, Any]]:
+        return list(self._audit_log)
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
+        self._workflows[workflow.id] = workflow
+        return workflow
+
+    def register_workflow_definition(
+        self,
+        definition: Mapping[str, Any],
+    ) -> Workflow:
+        name = str(definition.get("name") or "").strip()
+        if not name:
+            self._record_definition_rejection("", "", "invalid_name")
+            raise WorkflowDefinitionError(
+                "invalid_name",
+                "workflow definition requires a name",
+            )
+
+        workflow = Workflow(name, str(definition.get("description") or ""))
+        for index, raw_step in enumerate(definition.get("steps") or []):
+            if not isinstance(raw_step, Mapping):
+                self._record_definition_rejection(
+                    workflow.name,
+                    "",
+                    "invalid_step",
+                )
+                raise WorkflowDefinitionError(
+                    "invalid_step",
+                    "workflow step definition must be an object",
+                )
+
+            step_name = str(raw_step.get("name") or f"step-{index + 1}")
+            try:
+                timeout = parse_timeout_duration(raw_step)
+            except WorkflowDefinitionError as exc:
+                self._record_definition_rejection(
+                    workflow.name,
+                    step_name,
+                    exc.code,
+                )
+                raise
+
+            handler = raw_step.get("handler")
+            if not callable(handler):
+                self._record_definition_rejection(
+                    workflow.name,
+                    step_name,
+                    "invalid_handler",
+                )
+                raise WorkflowDefinitionError(
+                    "invalid_handler",
+                    "workflow step requires a callable handler",
+                )
+
+            workflow.add_step(
+                WorkflowStep(
+                    step_name,
+                    handler,
+                    retries=int(raw_step.get("retries") or 0),
+                    timeout=timeout,
+                ),
+            )
+
         self._workflows[workflow.id] = workflow
         return workflow
 
@@ -64,6 +275,8 @@ class WorkflowManager:
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
+            return False
+        if not self._validate_workflow_for_dispatch(workflow):
             return False
 
         workflow.status = StepStatus.RUNNING
@@ -81,6 +294,56 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _validate_workflow_for_dispatch(self, workflow: Workflow) -> bool:
+        for step in workflow.steps:
+            if isinstance(step.timeout, (Mapping, str)):
+                try:
+                    step.timeout = parse_timeout_duration(
+                        {"timeout": step.timeout},
+                    )
+                except WorkflowDefinitionError as exc:
+                    self._record_definition_rejection(
+                        workflow.name,
+                        step.name,
+                        exc.code,
+                        workflow.id,
+                        step.id,
+                    )
+                    return False
+
+            try:
+                _positive_seconds(step.timeout, 1.0)
+            except WorkflowDefinitionError as exc:
+                self._record_definition_rejection(
+                    workflow.name,
+                    step.name,
+                    exc.code,
+                    workflow.id,
+                    step.id,
+                )
+                return False
+        return True
+
+    def _record_definition_rejection(
+        self,
+        workflow_name: str,
+        step_name: str,
+        reason: str,
+        workflow_id: str = "",
+        step_id: str = "",
+    ) -> None:
+        decision = {
+            "event": "workflow_definition_rejected",
+            "reason": reason,
+            "workflow_id": workflow_id,
+            "workflow_name": workflow_name,
+            "step_id": step_id,
+            "step_name": step_name,
+        }
+        self._audit_log.append(decision)
+        metrics.increment("workflow.duration.invalid")
+        logger.warning("Rejected workflow definition: %s", decision)
 
 # 2019-03-27T19:58:07 update
 
