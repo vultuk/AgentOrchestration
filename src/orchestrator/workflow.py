@@ -4,6 +4,25 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
+RESERVED_METADATA_KEYS = {
+    "attempt",
+    "handler",
+    "id",
+    "lifecycle",
+    "queue",
+    "result",
+    "retries",
+    "routing",
+    "run_id",
+    "state",
+    "status",
+    "step_id",
+    "task_id",
+    "timeout",
+    "transition",
+    "workflow_id",
+}
+
 
 class StepStatus(Enum):
     PENDING = "pending"
@@ -13,8 +32,71 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class WorkflowMetadataError(ValueError):
+    def __init__(self, violations: List[Dict[str, str]]):
+        self.violations = violations
+        paths = ", ".join(item["path"] for item in violations)
+        super().__init__(
+            f"Reserved workflow metadata keys are not allowed: {paths}",
+        )
+
+
+def _normalize_metadata_key(key: Any) -> str:
+    return str(key).strip().lower().replace("-", "_")
+
+
+def find_reserved_metadata_keys(
+    metadata: Optional[Dict[str, Any]],
+    path: str = "metadata",
+) -> List[Dict[str, str]]:
+    if not metadata:
+        return []
+    if not isinstance(metadata, dict):
+        return [
+            {
+                "path": path,
+                "key": path.rsplit(".", 1)[-1],
+                "reason": "metadata_must_be_mapping",
+            },
+        ]
+
+    violations: List[Dict[str, str]] = []
+    for key, value in metadata.items():
+        key_name = str(key)
+        key_path = f"{path}.{key_name}"
+        normalized = _normalize_metadata_key(key_name)
+        if normalized in RESERVED_METADATA_KEYS or normalized.startswith("__"):
+            violations.append(
+                {
+                    "path": key_path,
+                    "key": key_name,
+                    "reason": "reserved_metadata_key",
+                },
+            )
+            continue
+        if isinstance(value, dict):
+            violations.extend(find_reserved_metadata_keys(value, key_path))
+    return violations
+
+
+def validate_user_metadata(
+    metadata: Optional[Dict[str, Any]],
+    path: str,
+) -> None:
+    violations = find_reserved_metadata_keys(metadata, path)
+    if violations:
+        raise WorkflowMetadataError(violations)
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -23,18 +105,34 @@ class WorkflowStep:
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
+        self.metadata = dict(metadata or {})
 
 
 class Workflow:
-    def __init__(self, name: str, description: str = ""):
+    def __init__(
+        self,
+        name: str,
+        description: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.description = description
+        self.metadata = dict(metadata or {})
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.audit_records: List[Dict[str, str]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        try:
+            validate_user_metadata(
+                step.metadata,
+                f"workflow.steps.{step.name}.metadata",
+            )
+        except WorkflowMetadataError as exc:
+            self.record_metadata_rejection(exc)
+            raise
         self.steps.append(step)
         self._step_map[step.id] = step
         return self
@@ -42,13 +140,53 @@ class Workflow:
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
 
+    def validate_definition_metadata(self) -> None:
+        violations = find_reserved_metadata_keys(
+            self.metadata,
+            "workflow.metadata",
+        )
+        for step in self.steps:
+            violations.extend(
+                find_reserved_metadata_keys(
+                    step.metadata,
+                    f"workflow.steps.{step.name}.metadata",
+                ),
+            )
+        if violations:
+            raise WorkflowMetadataError(violations)
+
+    def record_metadata_rejection(self, error: WorkflowMetadataError) -> None:
+        for violation in error.violations:
+            self.audit_records.append(
+                {
+                    "event": "workflow_metadata_rejected",
+                    "workflow_id": self.id,
+                    "path": violation["path"],
+                    "key": violation["key"],
+                    "reason": violation["reason"],
+                    "status": self.status.value,
+                },
+            )
+
 
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self.audit_records: List[Dict[str, str]] = []
 
-    def create_workflow(self, name: str, description: str = "") -> Workflow:
-        workflow = Workflow(name, description)
+    def create_workflow(
+        self,
+        name: str,
+        description: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Workflow:
+        workflow = Workflow(name, description, metadata)
+        try:
+            workflow.validate_definition_metadata()
+        except WorkflowMetadataError as exc:
+            workflow.record_metadata_rejection(exc)
+            self.audit_records.extend(workflow.audit_records)
+            raise
         self._workflows[workflow.id] = workflow
         return workflow
 
@@ -64,6 +202,15 @@ class WorkflowManager:
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
+            return False
+
+        try:
+            workflow.validate_definition_metadata()
+        except WorkflowMetadataError as exc:
+            workflow.record_metadata_rejection(exc)
+            self.audit_records.extend(
+                workflow.audit_records[-len(exc.violations):],
+            )
             return False
 
         workflow.status = StepStatus.RUNNING
