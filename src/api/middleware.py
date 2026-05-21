@@ -2,21 +2,130 @@
 
 import time
 import logging
-from typing import Callable
+from typing import Callable, Dict, Iterable, Optional, Tuple
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+DOCUMENTATION_PATHS = {
+    "/api/docs",
+    "/api/redoc",
+    "/api/openapi.json",
+    "/openapi.json",
+}
+PUBLIC_API_PATHS = {"/api/v2/auth/token"}
+DOC_SCOPE = "docs:read"
+DOC_ROLES = {"admin", "developer", "maintainer", "owner"}
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        requirement = self._auth_requirement(request.url.path)
+        if requirement:
+            error = self._authorize(request, *requirement)
+            if error:
+                status_code, content = error
+                return Response(status_code=status_code, content=content)
         return await call_next(request)
+
+    def _auth_requirement(
+        self, path: str
+    ) -> Optional[Tuple[Optional[str], Optional[Iterable[str]]]]:
+        if path in DOCUMENTATION_PATHS:
+            return DOC_SCOPE, DOC_ROLES
+        if path.startswith("/api/v2") and path not in PUBLIC_API_PATHS:
+            return None, None
+        return None
+
+    def _authorize(
+        self,
+        request: Request,
+        required_scope: Optional[str],
+        allowed_roles: Optional[Iterable[str]],
+    ) -> Optional[Tuple[int, str]]:
+        token, malformed = self._extract_token(request)
+        if malformed or not token:
+            return 401, "Unauthorized"
+
+        token_store = getattr(request.app.state, "auth_tokens", None)
+        if token_store is None:
+            return None
+
+        principal = token_store.get(token)
+        if principal is None:
+            return 401, "Unauthorized"
+
+        if principal.get("revoked"):
+            return 401, "Unauthorized"
+
+        expires_at = principal.get("expires_at")
+        if expires_at is not None and self._is_expired(expires_at):
+            return 401, "Unauthorized"
+
+        if required_scope and not self._has_scope(principal, required_scope):
+            return 403, "Forbidden"
+
+        if allowed_roles and not self._has_workspace_role(
+            request, principal, allowed_roles
+        ):
+            return 403, "Forbidden"
+
+        return None
+
+    def _extract_token(self, request: Request) -> Tuple[Optional[str], bool]:
+        authorization = request.headers.get("Authorization", "")
+        if authorization:
+            if not authorization.startswith("Bearer "):
+                return None, True
+            token = authorization.removeprefix("Bearer ").strip()
+            return token or None, not bool(token)
+
+        session_token = request.cookies.get("ao_session")
+        if session_token:
+            session_token = session_token.strip()
+        return session_token or None, False
+
+    def _is_expired(self, expires_at) -> bool:
+        try:
+            return float(expires_at) <= time.time()
+        except (TypeError, ValueError):
+            return True
+
+    def _has_scope(self, principal: Dict, required_scope: str) -> bool:
+        scopes = principal.get("scopes", [])
+        if isinstance(scopes, str):
+            scopes = [scopes]
+        return required_scope in set(scopes)
+
+    def _has_workspace_role(
+        self,
+        request: Request,
+        principal: Dict,
+        allowed_roles: Iterable[str],
+    ) -> bool:
+        workspace_id = (
+            request.headers.get("X-Workspace-Id")
+            or principal.get("workspace_id")
+            or "default"
+        )
+        roles_by_workspace = principal.get("workspace_roles") or {}
+        if isinstance(roles_by_workspace, dict):
+            roles = roles_by_workspace.get(
+                workspace_id,
+                principal.get("roles", []),
+            )
+        else:
+            roles = principal.get("roles", [])
+        roles = roles or []
+        if isinstance(roles, str):
+            roles = [roles]
+        return bool(set(roles).intersection(allowed_roles))
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -26,14 +135,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +158,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
