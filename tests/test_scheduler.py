@@ -64,6 +64,13 @@ class TestTaskScheduler:
         assert recovered["state"] == "running"
         assert asyncio.run(scheduler.dequeue()) is None
         assert "task-b" in scheduler.deferred_recovery
+        deferred_record = scheduler.deferred_recovery["task-b"]
+        assert deferred_record["task"]["state"] == "running"
+        assert deferred_record["task"]["recovery_state"] == "deferred"
+        assert (
+            deferred_record["task"]["deferred_reason"]
+            == "tenant_concurrency_limit"
+        )
 
         deferred_audit = [
             entry for entry in scheduler.audit_log
@@ -78,6 +85,10 @@ class TestTaskScheduler:
         assert "task-b" not in scheduler.deferred_recovery
         released = asyncio.run(scheduler.dequeue())
         assert released["id"] == "task-b"
+        assert released["state"] == "running"
+        assert released["recovered_after_restart"] is True
+        assert released["recovery_state"] == "queued"
+        assert "deferred_reason" not in released
 
     def test_recovery_rejects_duplicate_restart_task(self):
         scheduler = TaskScheduler(max_concurrent_per_tenant=1)
@@ -101,6 +112,63 @@ class TestTaskScheduler:
         ][-1]
         assert rejection["decision"] == "rejected"
         assert rejection["reason"] == "duplicate_task"
+
+    def test_recovery_counts_existing_in_flight_capacity(self):
+        import asyncio
+
+        scheduler = TaskScheduler(max_concurrent_per_tenant=2)
+        scheduler.enqueue({"id": "active-a", "tenant_id": "tenant-1"})
+        active = asyncio.run(scheduler.dequeue())
+        assert active["id"] == "active-a"
+
+        result = scheduler.recover_after_restart([
+            {"id": "task-b", "tenant_id": "tenant-1", "state": "running"},
+            {"id": "task-c", "tenant_id": "tenant-1", "state": "running"},
+        ])
+
+        assert result == {
+            "accepted": ["task-b"],
+            "deferred": ["task-c"],
+            "rejected": [],
+        }
+        recovered = asyncio.run(scheduler.dequeue())
+        assert recovered["id"] == "task-b"
+        assert asyncio.run(scheduler.dequeue()) is None
+        assert "task-c" in scheduler.deferred_recovery
+
+    def test_dequeue_skips_blocked_tenant_and_preserves_priority(self):
+        import asyncio
+
+        scheduler = TaskScheduler(max_concurrent_per_tenant=1)
+        scheduler.enqueue({
+            "id": "active-a",
+            "tenant_id": "tenant-a",
+        })
+        active = asyncio.run(scheduler.dequeue())
+        assert active["id"] == "active-a"
+
+        scheduler.enqueue({
+            "id": "blocked-high",
+            "tenant_id": "tenant-a",
+        }, priority=10)
+        scheduler.enqueue({
+            "id": "eligible-low",
+            "tenant_id": "tenant-b",
+        }, priority=1)
+
+        eligible = asyncio.run(scheduler.dequeue())
+        assert eligible["id"] == "eligible-low"
+
+        deferred_audit = [
+            entry for entry in scheduler.audit_log
+            if entry["task_id"] == "blocked-high"
+        ][-1]
+        assert deferred_audit["source"] == "queued_dispatch"
+        assert deferred_audit["decision"] == "deferred"
+
+        assert scheduler.complete("active-a")
+        blocked = asyncio.run(scheduler.dequeue())
+        assert blocked["id"] == "blocked-high"
 
 # 2019-01-09T19:07:03 update
 

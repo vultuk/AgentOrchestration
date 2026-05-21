@@ -123,7 +123,7 @@ class TaskScheduler:
                         task,
                         decision="deferred",
                         reason="tenant_concurrency_limit",
-                        source="dequeue",
+                        source="queued_dispatch",
                         queue=queue,
                     )
 
@@ -181,6 +181,8 @@ class TaskScheduler:
             active_count = reserved_by_tenant.get(tenant_id, 0)
             if self._max_concurrent_per_tenant is not None:
                 if active_count >= self._max_concurrent_per_tenant:
+                    task["recovery_state"] = "deferred"
+                    task["deferred_reason"] = "tenant_concurrency_limit"
                     self._deferred_recovery[task_id] = {
                         "task": task,
                         "queue": queue,
@@ -228,6 +230,10 @@ class TaskScheduler:
                 reserved_by_tenant[tenant_id] = active_count + 1
 
             self._deferred_recovery.pop(task_id)
+            task["recovered_after_restart"] = True
+            task["recovered_at"] = time.time()
+            task["recovery_state"] = "queued"
+            task.pop("deferred_reason", None)
             self.enqueue(
                 task,
                 record.get("queue", queue),
