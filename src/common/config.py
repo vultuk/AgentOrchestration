@@ -14,7 +14,14 @@ class Config:
 
     def load(self, path: str) -> None:
         with open(path) as f:
-            self._data = json.load(f)
+            loaded = json.load(f)
+        self._data = self._validate_config_data(loaded)
+
+    @staticmethod
+    def _validate_config_data(data: Any) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("Config file root must be a JSON object")
+        return data
 
     def _load_env_overrides(self) -> None:
         prefix = "AO_"

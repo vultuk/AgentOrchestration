@@ -1,3 +1,4 @@
+import json
 import pytest
 from src.common.config import Config
 
@@ -31,6 +32,50 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_failed_reload_preserves_existing_config(self, tmp_path):
+        good_config = tmp_path / "good.json"
+        good_config.write_text('{"app": {"name": "stable", "port": 8080}}')
+        bad_config = tmp_path / "bad.json"
+        bad_config.write_text('{"app": {"name": "broken"')
+
+        config = Config(str(good_config))
+
+        with pytest.raises(json.JSONDecodeError):
+            config.load(str(bad_config))
+
+        assert config.get("app.name") == "stable"
+        assert config.get("app.port") == 8080
+        assert config.to_dict() == {"app": {"name": "stable", "port": 8080}}
+
+    def test_invalid_root_reload_preserves_existing_config(self, tmp_path):
+        good_config = tmp_path / "good.json"
+        good_config.write_text('{"app": {"name": "stable"}}')
+        invalid_config = tmp_path / "invalid.json"
+        invalid_config.write_text('["not", "an", "object"]')
+
+        config = Config(str(good_config))
+
+        with pytest.raises(ValueError, match="JSON object"):
+            config.load(str(invalid_config))
+
+        assert config.to_dict() == {"app": {"name": "stable"}}
+
+    def test_successful_reload_swaps_entire_config_after_validation(
+        self,
+        tmp_path,
+    ):
+        first_config = tmp_path / "first.json"
+        first_config.write_text('{"app": {"name": "old"}, "old": true}')
+        second_config = tmp_path / "second.json"
+        second_config.write_text('{"app": {"name": "new"}, "new": true}')
+
+        config = Config(str(first_config))
+        config.load(str(second_config))
+
+        assert config.get("app.name") == "new"
+        assert config.get("old") is None
+        assert config.get("new") is True
 
 # 2019-02-01T18:58:35 update
 
