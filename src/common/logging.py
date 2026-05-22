@@ -4,21 +4,29 @@ import json
 import logging
 import sys
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict
+
+from src.common.exception_tracking import sanitize_exception_context
 
 
 class StructuredFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
+        has_exception = bool(record.exc_info and record.exc_info[0])
         log_entry: Dict = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": (
+                "exception captured" if has_exception else record.getMessage()
+            ),
         }
         if hasattr(record, "request_id"):
             log_entry["request_id"] = record.request_id
-        if record.exc_info and record.exc_info[0]:
-            log_entry["exception"] = self.formatException(record.exc_info)
+        if has_exception:
+            log_entry["exception"] = sanitize_exception_context(
+                context=getattr(record, "exception_context", None),
+                error=record.exc_info[1],
+            )
         return json.dumps(log_entry)
 
 
@@ -27,8 +35,15 @@ def configure_logging(level: str = "INFO", json_output: bool = True) -> None:
     if json_output:
         handler.setFormatter(StructuredFormatter())
     else:
-        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), handlers=[handler])
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+            )
+        )
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        handlers=[handler],
+    )
 
 # 2019-01-14T10:37:21 update
 

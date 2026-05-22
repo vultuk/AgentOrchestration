@@ -6,17 +6,24 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.exception_tracking import ExceptionTracker
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
 
 
 class OrchestrationEngine:
-    def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
+    def __init__(
+        self,
+        max_workers: int = 10,
+        agent_timeout: int = 300,
+        exception_tracker: Optional[ExceptionTracker] = None,
+    ):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
+        self.exception_tracker = exception_tracker or ExceptionTracker()
         self._running = False
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
@@ -28,6 +35,9 @@ class OrchestrationEngine:
     def register_hook(self, event: str, callback: Callable) -> None:
         if event in self._hooks:
             self._hooks[event].append(callback)
+
+    def exception_events(self) -> List[Dict[str, Any]]:
+        return self.exception_tracker.list_events()
 
     async def start(self) -> None:
         self._running = True
@@ -68,9 +78,23 @@ class OrchestrationEngine:
             logger.info(f"Task {task_id} completed successfully")
 
         except Exception as e:
-            logger.error(f"Task {task_id} failed: {e}")
+            error_event = self.exception_tracker.capture(
+                e,
+                context={
+                    "component": "orchestrator.engine",
+                    "operation": "execute_task",
+                    "agent_id": agent_id,
+                    "task": task,
+                },
+                task=task,
+            )
+            logger.error(
+                "Task %s failed with %s",
+                error_event["task_id"],
+                error_event["error_class"],
+            )
             for hook in self._hooks["on_error"]:
-                await hook(task, e)
+                await hook(error_event)
 
     async def _run_agent_task(self, agent: Dict, task: Dict) -> Any:
         loop = asyncio.get_event_loop()
@@ -82,7 +106,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 
