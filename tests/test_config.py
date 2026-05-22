@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,22 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_to_dict_returns_deep_copy(self):
+        config = Config()
+        config.set(
+            "service.options",
+            {"retries": [1, 2], "labels": {"tier": "prod"}},
+        )
+
+        data = config.to_dict()
+        data["service"]["options"]["retries"].append(3)
+        data["service"]["options"]["labels"]["tier"] = "debug"
+        data["service"]["options"]["labels"]["new"] = "value"
+
+        assert config.get("service.options.retries") == [1, 2]
+        assert config.get("service.options.labels.tier") == "prod"
+        assert config.get("service.options.labels.new") is None
 
 # 2019-02-01T18:58:35 update
 
