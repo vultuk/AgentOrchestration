@@ -1,10 +1,13 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
+import hashlib
 import heapq
 import time
+from copy import deepcopy
 from typing import Any, Dict, Optional
 from uuid import uuid4
+
+from src.common.metrics import MetricsCollector, metrics
 
 
 class PriorityQueue:
@@ -31,30 +34,59 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        max_concurrent_per_key: int = 0,
+        metrics_collector: MetricsCollector = metrics,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self._max_concurrent_per_key = max(0, max_concurrent_per_key)
+        self._running_by_budget_key: Dict[str, int] = {}
+        self._budget_key_by_task: Dict[str, str] = {}
+        self._concurrency_audit = []
+        self._metrics = metrics_collector
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    @property
+    def concurrency_audit_records(self):
+        return deepcopy(self._concurrency_audit)
+
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
+        task["priority"] = priority
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -63,23 +95,112 @@ class TaskScheduler:
                 self.enqueue(task, queue)
 
         if queue in self._queues and len(self._queues[queue]) > 0:
+            task = self._queues[queue].peek()
+            if task and not self._can_start_task(task):
+                self._record_concurrency_decision(
+                    task,
+                    accepted=False,
+                    reason="concurrency_budget_exhausted",
+                    queue=queue,
+                )
+                return None
+
             task = self._queues[queue].pop()
             if task:
                 self._in_flight[task["id"]] = task
+                self._mark_budget_started(task)
+                self._record_concurrency_decision(
+                    task,
+                    accepted=True,
+                    reason="accepted",
+                    queue=queue,
+                )
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        task = self._in_flight.pop(task_id, None)
+        if not task:
+            return False
+        self._release_budget(task_id)
+        return True
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
         if task:
+            self._release_budget(task_id)
             task["retries"] += 1
             if task["retries"] < self._max_retries:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def _can_start_task(self, task: Dict) -> bool:
+        budget_key = self._budget_key(task)
+        if not budget_key or self._max_concurrent_per_key <= 0:
+            return True
+        current = self._running_by_budget_key.get(budget_key, 0)
+        return current < self._max_concurrent_per_key
+
+    def _mark_budget_started(self, task: Dict) -> None:
+        budget_key = self._budget_key(task)
+        if not budget_key or self._max_concurrent_per_key <= 0:
+            return
+        self._running_by_budget_key[budget_key] = (
+            self._running_by_budget_key.get(budget_key, 0) + 1
+        )
+        self._budget_key_by_task[task["id"]] = budget_key
+
+    def _release_budget(self, task_id: str) -> None:
+        budget_key = self._budget_key_by_task.pop(task_id, None)
+        if not budget_key:
+            return
+        current = self._running_by_budget_key.get(budget_key, 0)
+        if current <= 1:
+            self._running_by_budget_key.pop(budget_key, None)
+        else:
+            self._running_by_budget_key[budget_key] = current - 1
+
+    @staticmethod
+    def _budget_key(task: Dict) -> Optional[str]:
+        for field in ("concurrency_key", "run_id", "tenant_id", "agent_id"):
+            value = task.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _record_concurrency_decision(
+        self,
+        task: Dict,
+        accepted: bool,
+        reason: str,
+        queue: str,
+    ) -> None:
+        status = "accepted" if accepted else "rejected"
+        self._metrics.increment(f"scheduler.concurrency_budget.{status}")
+        budget_key = self._budget_key(task) or ""
+        self._concurrency_audit.append(
+            {
+                "component": "scheduler_concurrency_limiter",
+                "accepted": accepted,
+                "reason": reason,
+                "queue": queue,
+                "manual_triggered": bool(task.get("manual_triggered")),
+                "task_ref": self._hash_ref(task.get("id", "")),
+                "budget_ref": self._hash_ref(budget_key),
+                "running_for_budget": self._running_by_budget_key.get(
+                    budget_key,
+                    0,
+                ),
+                "limit": self._max_concurrent_per_key,
+                "recorded_at": time.time(),
+            }
+        )
+
+    @staticmethod
+    def _hash_ref(value: str) -> str:
+        raw_value = value if isinstance(value, str) else ""
+        return hashlib.sha256(raw_value.encode("utf-8")).hexdigest()[:16]
 
 # 2019-04-25T08:37:12 update
 

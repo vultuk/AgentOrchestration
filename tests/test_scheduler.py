@@ -1,4 +1,5 @@
-import pytest
+import asyncio
+from src.common.metrics import MetricsCollector
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +13,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +20,89 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_manual_triggered_run_counts_against_concurrency_budget(self):
+        metrics = MetricsCollector()
+        scheduler = TaskScheduler(
+            max_concurrent_per_key=1,
+            metrics_collector=metrics,
+        )
+        manual_id = scheduler.enqueue(
+            {
+                "type": "run",
+                "concurrency_key": "tenant-secret",
+                "manual_triggered": True,
+                "payload": {"private_runtime_data": "do-not-audit"},
+            },
+        )
+        scheduled_id = scheduler.enqueue(
+            {
+                "type": "run",
+                "concurrency_key": "tenant-secret",
+                "manual_triggered": False,
+            },
+        )
+
+        first = asyncio.run(scheduler.dequeue())
+        assert first["id"] == manual_id
+
+        assert asyncio.run(scheduler.dequeue()) is None
+
+        audit = scheduler.concurrency_audit_records[-1]
+        assert audit["accepted"] is False
+        assert audit["reason"] == "concurrency_budget_exhausted"
+        assert audit["manual_triggered"] is False
+        assert "tenant-secret" not in str(audit)
+        assert "private_runtime_data" not in str(audit)
+
+        assert scheduler.complete(manual_id)
+        second = asyncio.run(scheduler.dequeue())
+        assert second["id"] == scheduled_id
+
+        counters = metrics.snapshot()["counters"]
+        assert counters["scheduler.concurrency_budget.accepted"] == 2
+        assert counters["scheduler.concurrency_budget.rejected"] == 1
+
+    def test_independent_concurrency_keys_can_run_together(self):
+        scheduler = TaskScheduler(max_concurrent_per_key=1)
+        first_id = scheduler.enqueue(
+            {"type": "run", "concurrency_key": "tenant-a"},
+        )
+        second_id = scheduler.enqueue(
+            {"type": "run", "concurrency_key": "tenant-b"},
+        )
+
+        first = asyncio.run(scheduler.dequeue())
+        second = asyncio.run(scheduler.dequeue())
+
+        assert first["id"] == first_id
+        assert second["id"] == second_id
+
+    def test_fail_releases_concurrency_budget_before_retry(self):
+        scheduler = TaskScheduler(max_concurrent_per_key=1)
+        task_id = scheduler.enqueue(
+            {"type": "run", "concurrency_key": "tenant-a"},
+        )
+
+        first = asyncio.run(scheduler.dequeue())
+        assert first["id"] == task_id
+        assert scheduler.fail(task_id)
+
+        retried = asyncio.run(scheduler.dequeue())
+        assert retried is not None
+        assert retried["concurrency_key"] == "tenant-a"
 
 # 2019-01-09T19:07:03 update
 
