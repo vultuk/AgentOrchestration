@@ -1,18 +1,122 @@
 """API middleware components."""
 
-import time
+import hashlib
 import logging
-from typing import Callable
+import time
+from contextvars import ContextVar
+from typing import Callable, Dict, Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+_REQUEST_AGENT_CONTEXT: ContextVar[Optional[Dict[str, str]]] = ContextVar(
+    "request_agent_context",
+    default=None,
+)
+_AGENT_CONTEXT_HEADER = "X-Agent-Context-Cleared"
+
+
+def get_request_agent_context() -> Optional[Dict[str, str]]:
+    context = _REQUEST_AGENT_CONTEXT.get()
+    return dict(context) if context else None
+
+
+def _hash_reference(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _agent_id_from_path(path: str) -> Optional[str]:
+    parts = [part for part in path.split("/") if part]
+    try:
+        api_index = parts.index("api")
+    except ValueError:
+        return None
+    expected_prefix = parts[api_index:api_index + 3]
+    if expected_prefix != ["api", "v2", "agents"]:
+        return None
+    if len(parts) <= api_index + 3:
+        return None
+    agent_id = parts[api_index + 3]
+    if agent_id in {"count", ""}:
+        return None
+    return agent_id
+
+
+def _context_for_request(request: Request) -> Optional[Dict[str, str]]:
+    agent_id = _agent_id_from_path(request.url.path)
+    if not agent_id:
+        return None
+    return {
+        "agent_ref": _hash_reference(agent_id),
+        "source": "path",
+    }
+
+
+def sanitize_request_path(path: str) -> str:
+    parts = [part for part in path.split("/") if part]
+    try:
+        api_index = parts.index("api")
+    except ValueError:
+        return path
+    if parts[api_index:api_index + 3] != ["api", "v2", "agents"]:
+        return path
+    if len(parts) <= api_index + 3 or parts[api_index + 3] == "count":
+        return path
+    sanitized = list(parts)
+    sanitized[api_index + 3] = "{agent_id}"
+    return "/" + "/".join(sanitized)
+
+
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        context = _context_for_request(request)
+        token = _REQUEST_AGENT_CONTEXT.set(context)
+        safe_path = sanitize_request_path(request.url.path)
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            response.headers[_AGENT_CONTEXT_HEADER] = "true"
+            return response
+        except Exception:
+            logger.error(
+                "%s %s %s request_context_cleared=true error=true",
+                request.method,
+                safe_path,
+                status_code,
+            )
+            response = Response(
+                status_code=500,
+                content="Internal Server Error",
+            )
+            response.headers[_AGENT_CONTEXT_HEADER] = "true"
+            return response
+        finally:
+            _REQUEST_AGENT_CONTEXT.reset(token)
+            logger.info(
+                "%s %s %s request_context_cleared=true",
+                request.method,
+                safe_path,
+                status_code,
+            )
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +130,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +153,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        safe_path = sanitize_request_path(request.url.path)
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            safe_path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
