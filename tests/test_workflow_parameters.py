@@ -69,6 +69,23 @@ def test_rejects_forbidden_override_before_workflow_starts():
     assert "True" not in str(workflow.audit_log[-1])
 
 
+def test_missing_required_parameter_rejected_before_dispatch():
+    manager = WorkflowManager()
+    workflow = manager.create_workflow("required-parameter")
+    workflow.define_parameter("routing_policy", required=True)
+    workflow.add_step(WorkflowStep("must-not-run", lambda: "ran"))
+
+    assert not manager.execute_workflow(workflow.id)
+
+    assert workflow.status is StepStatus.PENDING
+    assert workflow.steps[0].status is StepStatus.PENDING
+    assert workflow.bound_parameters == {}
+    assert workflow.audit_log[-1]["decision"] == "rejected"
+    assert workflow.audit_log[-1]["reason"] == (
+        "required_workflow_parameter_missing"
+    )
+
+
 def test_rejects_lifecycle_rebind_and_preserves_workflow_state():
     manager = WorkflowManager()
     workflow = manager.create_workflow("running-workflow")
