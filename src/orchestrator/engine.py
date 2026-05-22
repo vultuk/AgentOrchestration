@@ -1,22 +1,35 @@
 """Orchestration Engine — Core execution and coordination logic."""
 
 import asyncio
+import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.metrics import MetricsCollector
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
+
+_UNKNOWN_RUN_REF = "unknown"
+_EVENT_TRANSITIONS: Dict[str, Tuple[Set[str], str]] = {
+    "run.started": ({"pending"}, "running"),
+    "run.completed": ({"running"}, "completed"),
+    "run.failed": ({"running"}, "failed"),
+    "run.cancelled": ({"pending", "running"}, "cancelled"),
+}
 
 
 class OrchestrationEngine:
     def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
+        self.metrics = MetricsCollector()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
+        self._run_events: Dict[str, Dict[str, Any]] = {}
+        self._event_audit: List[Dict[str, Any]] = []
         self._running = False
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
@@ -28,6 +41,145 @@ class OrchestrationEngine:
     def register_hook(self, event: str, callback: Callable) -> None:
         if event in self._hooks:
             self._hooks[event].append(callback)
+
+    def dispatch_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        event_type = str(event.get("type") or "")
+        run_id = str(event.get("run_id") or "")
+        attempt = self._integer_event_field(event, "attempt", default=1)
+        revision = self._integer_event_field(event, "revision", default=0)
+        run_state = self._run_events.get(run_id)
+
+        if not run_id:
+            return self._quarantine_event(
+                event_type,
+                run_id,
+                "missing_run_id",
+                attempt,
+                revision,
+            )
+        if event_type not in _EVENT_TRANSITIONS:
+            return self._quarantine_event(
+                event_type,
+                run_id,
+                "unknown_event_type",
+                attempt,
+                revision,
+            )
+
+        if run_state:
+            current_attempt = run_state["attempt"]
+            current_revision = run_state["revision"]
+            if attempt < current_attempt:
+                return self._quarantine_event(
+                    event_type,
+                    run_id,
+                    "stale_attempt",
+                    attempt,
+                    revision,
+                )
+            if attempt == current_attempt and revision <= current_revision:
+                return self._quarantine_event(
+                    event_type,
+                    run_id,
+                    "stale_revision",
+                    attempt,
+                    revision,
+                )
+
+        allowed_sources, target_lifecycle = _EVENT_TRANSITIONS[event_type]
+        current_lifecycle = run_state["lifecycle"] if run_state else "pending"
+        if current_lifecycle not in allowed_sources:
+            return self._quarantine_event(
+                event_type,
+                run_id,
+                "invalid_lifecycle",
+                attempt,
+                revision,
+            )
+
+        next_state = {
+            "lifecycle": target_lifecycle,
+            "attempt": attempt,
+            "revision": revision,
+            "event_type": event_type,
+        }
+        self._run_events[run_id] = next_state
+        return self._record_event_decision(
+            "accepted",
+            event_type,
+            run_id,
+            "",
+            attempt,
+            revision,
+        )
+
+    def get_run_event_state(self, run_id: str) -> Optional[Dict[str, Any]]:
+        state = self._run_events.get(run_id)
+        return dict(state) if state else None
+
+    def event_audit_records(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._event_audit]
+
+    def _integer_event_field(
+        self,
+        event: Dict[str, Any],
+        field: str,
+        default: int,
+    ) -> int:
+        try:
+            return int(event.get(field, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _run_ref(self, run_id: str) -> str:
+        if not run_id:
+            return _UNKNOWN_RUN_REF
+        return hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:12]
+
+    def _quarantine_event(
+        self,
+        event_type: str,
+        run_id: str,
+        reason: str,
+        attempt: int,
+        revision: int,
+    ) -> Dict[str, Any]:
+        return self._record_event_decision(
+            "quarantined",
+            event_type,
+            run_id,
+            reason,
+            attempt,
+            revision,
+        )
+
+    def _record_event_decision(
+        self,
+        decision: str,
+        event_type: str,
+        run_id: str,
+        reason: str,
+        attempt: int,
+        revision: int,
+    ) -> Dict[str, Any]:
+        record = {
+            "decision": decision,
+            "event_type": event_type or "missing",
+            "reason": reason,
+            "run_ref": self._run_ref(run_id),
+            "attempt": attempt,
+            "revision": revision,
+        }
+        self._event_audit.append(record)
+        self.metrics.increment(f"orchestrator.events.{decision}")
+        logger.info(
+            "orchestrator event decision=%s type=%s reason=%s run_ref=%s",
+            decision,
+            record["event_type"],
+            reason or "none",
+            record["run_ref"],
+        )
+        return dict(record)
 
     async def start(self) -> None:
         self._running = True
@@ -82,7 +234,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 
