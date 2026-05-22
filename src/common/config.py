@@ -5,6 +5,9 @@ import json
 from typing import Any, Dict, Optional
 
 
+CONFIG_ENV_PREFIX = "AO_CONFIG_"
+
+
 class Config:
     def __init__(self, config_path: Optional[str] = None):
         self._data: Dict[str, Any] = {}
@@ -17,10 +20,11 @@ class Config:
             self._data = json.load(f)
 
     def _load_env_overrides(self) -> None:
-        prefix = "AO_"
         for key, value in os.environ.items():
-            if key.startswith(prefix):
-                config_key = key[len(prefix):].lower().replace("_", ".")
+            if key.startswith(CONFIG_ENV_PREFIX):
+                config_key = (
+                    key[len(CONFIG_ENV_PREFIX):].lower().replace("_", ".")
+                )
                 self._set_nested(config_key, value)
 
     def _set_nested(self, key: str, value: Any) -> None:

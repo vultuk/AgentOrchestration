@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,25 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_ignores_runtime_ao_environment_variables(self, monkeypatch):
+        monkeypatch.setenv("AO_AGENT_ID", "runtime-agent-1")
+        monkeypatch.setenv("AO_API_KEY", "runtime-api-key")
+
+        config = Config()
+
+        assert config.get("agent.id") is None
+        assert config.get("api.key") is None
+        assert "agent" not in config.to_dict()
+
+    def test_loads_scoped_config_environment_overrides(self, monkeypatch):
+        monkeypatch.setenv("AO_CONFIG_APP_PORT", "8080")
+        monkeypatch.setenv("AO_CONFIG_DATABASE_HOST", "localhost")
+
+        config = Config()
+
+        assert config.get("app.port") == "8080"
+        assert config.get("database.host") == "localhost"
 
 # 2019-02-01T18:58:35 update
 
