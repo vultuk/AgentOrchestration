@@ -1,22 +1,30 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.webhooks import webhook_delivery_service
 
 router = APIRouter()
 registry = AgentRegistry()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +61,107 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/webhooks/endpoints")
+async def register_webhook_endpoint(
+    workspace_id: str,
+    endpoint_id: str,
+    url: str,
+    enabled: bool = True,
+):
+    try:
+        return webhook_delivery_service.register_endpoint(
+            workspace_id,
+            endpoint_id,
+            url,
+            enabled=enabled,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/webhooks/endpoints/{endpoint_id}/disable")
+async def disable_webhook_endpoint(workspace_id: str, endpoint_id: str):
+    try:
+        return webhook_delivery_service.disable_endpoint(
+            workspace_id,
+            endpoint_id,
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail="Webhook endpoint not found",
+        )
+
+
+@router.post("/webhooks/endpoints/{endpoint_id}/rotate")
+async def rotate_webhook_endpoint(
+    workspace_id: str,
+    endpoint_id: str,
+    url: Optional[str] = None,
+):
+    try:
+        return webhook_delivery_service.rotate_endpoint(
+            workspace_id,
+            endpoint_id,
+            url=url,
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail="Webhook endpoint not found",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/webhooks/deliver")
+async def deliver_webhook_event(
+    workspace_id: str,
+    endpoint_id: str,
+    event_id: str,
+    event_type: str,
+    payload: Optional[Dict] = None,
+    event_revision: int = 1,
+    endpoint_version: Optional[int] = None,
+    idempotency_key: Optional[str] = None,
+):
+    return webhook_delivery_service.deliver_event(
+        workspace_id=workspace_id,
+        endpoint_id=endpoint_id,
+        event_id=event_id,
+        event_type=event_type,
+        payload=payload,
+        event_revision=event_revision,
+        endpoint_version=endpoint_version,
+        idempotency_key=idempotency_key,
+    )
+
+
+@router.post("/webhooks/callbacks")
+async def record_webhook_callback(
+    workspace_id: str,
+    endpoint_id: str,
+    idempotency_key: str,
+    callback_status: str,
+    endpoint_version: Optional[int] = None,
+):
+    return webhook_delivery_service.record_callback(
+        workspace_id,
+        endpoint_id,
+        idempotency_key,
+        callback_status,
+        endpoint_version=endpoint_version,
+    )
+
+
+@router.get("/webhooks/deliveries/{idempotency_key}")
+async def get_webhook_delivery(idempotency_key: str):
+    delivery = webhook_delivery_service.get_delivery(idempotency_key)
+    if not delivery:
+        raise HTTPException(status_code=404, detail="Delivery not found")
+    return delivery
 
 # 2019-03-18T11:10:18 update
 
