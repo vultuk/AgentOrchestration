@@ -1,4 +1,4 @@
-import pytest
+import src.common.metrics as metrics_module
 from src.common.metrics import MetricsCollector
 
 
@@ -23,6 +23,14 @@ class TestMetricsCollector:
         snapshot = self.metrics.snapshot()
         assert snapshot["histograms"]["response.time"]["count"] == 2
         assert snapshot["histograms"]["response.time"]["avg"] == 1.0
+
+    def test_snapshot_includes_stable_collection_timestamp(self, monkeypatch):
+        monkeypatch.setattr(metrics_module.time, "time", lambda: 0.0)
+        snapshot = self.metrics.snapshot()
+        assert snapshot["collected_at"] == "1970-01-01T00:00:00.000Z"
+        assert snapshot["counters"] == {}
+        assert snapshot["gauges"] == {}
+        assert snapshot["histograms"] == {}
 
     def test_timer(self):
         self.metrics.start_timer("operation")

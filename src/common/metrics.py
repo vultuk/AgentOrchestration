@@ -2,8 +2,9 @@
 
 import time
 from collections import defaultdict
-from typing import Dict, List
+from datetime import datetime, timezone
 from threading import Lock
+from typing import Dict, List
 
 
 class MetricsCollector:
@@ -34,17 +35,28 @@ class MetricsCollector:
         with self._lock:
             if metric in self._timers:
                 duration = time.time() - self._timers.pop(metric)
-                self.observe(metric, duration)
+                self._histograms[metric].append(duration)
                 return duration
         return 0.0
 
     def snapshot(self) -> Dict:
+        collected_at = datetime.fromtimestamp(
+            time.time(),
+            timezone.utc,
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         with self._lock:
             return {
+                "collected_at": collected_at,
                 "counters": dict(self._counters),
                 "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "histograms": {
+                    k: {
+                        "count": len(v),
+                        "sum": sum(v),
+                        "avg": sum(v) / len(v) if v else 0,
+                    }
+                    for k, v in self._histograms.items()
+                },
             }
 
 
