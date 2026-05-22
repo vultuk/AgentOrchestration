@@ -1,31 +1,73 @@
 """CLI entry point for the agent orchestrator."""
 
 import argparse
+import json
+import os
 import sys
 
-from src.common.config import Config
+from src import __version__
 from src.common.logging import configure_logging
+from src.deploy import ReleaseIdentity, render_manifest_file
 
 
 def cli():
     parser = argparse.ArgumentParser(description="Agent Orchestrator CLI")
     parser.add_argument("--config", "-c", help="Path to config file")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose output",
+    )
 
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        help="Available commands",
+    )
 
-    init_parser = subparsers.add_parser("init", help="Initialize a new project")
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Initialize a new project",
+    )
     init_parser.add_argument("name", help="Project name")
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy an agent")
     deploy_parser.add_argument("manifest", help="Path to agent manifest file")
+    deploy_parser.add_argument(
+        "--commit-sha",
+        default=os.getenv("AO_RELEASE_COMMIT"),
+    )
+    deploy_parser.add_argument(
+        "--image-digest",
+        default=os.getenv("AO_IMAGE_DIGEST"),
+    )
+    deploy_parser.add_argument("--package-version", default=__version__)
+    deploy_parser.add_argument(
+        "--source-ref",
+        default=os.getenv("AO_SOURCE_REF", ""),
+    )
+    deploy_parser.add_argument(
+        "--source-ref-type",
+        default=os.getenv("AO_SOURCE_REF_TYPE", "branch"),
+    )
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
-    status_parser.add_argument("--watch", "-w", action="store_true", help="Watch mode")
+    status_parser.add_argument(
+        "--watch",
+        "-w",
+        action="store_true",
+        help="Watch mode",
+    )
 
     logs_parser = subparsers.add_parser("logs", help="View agent logs")
     logs_parser.add_argument("agent_id", help="Agent ID")
-    logs_parser.add_argument("--tail", "-t", type=int, default=50, help="Number of lines")
+    logs_parser.add_argument(
+        "--tail",
+        "-t",
+        type=int,
+        default=50,
+        help="Number of lines",
+    )
 
     args = parser.parse_args()
 
@@ -37,7 +79,18 @@ def cli():
     if args.command == "init":
         print(f"Initializing project: {args.name}")
     elif args.command == "deploy":
-        print(f"Deploying agent from manifest: {args.manifest}")
+        try:
+            identity = ReleaseIdentity(
+                commit_sha=args.commit_sha,
+                package_version=args.package_version,
+                image_digest=args.image_digest,
+                source_ref=args.source_ref,
+                source_ref_type=args.source_ref_type,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        rendered = render_manifest_file(args.manifest, identity)
+        print(json.dumps(rendered, sort_keys=True))
     elif args.command == "status":
         print("Checking agent status...")
     elif args.command == "logs":
