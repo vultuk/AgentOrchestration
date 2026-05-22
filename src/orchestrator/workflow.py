@@ -1,8 +1,16 @@
-"""Workflow Manager — Defines and executes multi-step agent workflows."""
+"""Workflow Manager — Defines and runs multi-step agent workflows."""
 
+import logging
+import time
+from copy import deepcopy
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+from src.common.metrics import metrics
+
+logger = logging.getLogger(__name__)
 
 
 class StepStatus(Enum):
@@ -13,8 +21,26 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class WorkflowParameterError(ValueError):
+    """Raised when parameter binding violates lifecycle safety."""
+
+
+@dataclass(frozen=True)
+class WorkflowParameterSpec:
+    name: str
+    default: Any = None
+    required: bool = False
+    allow_override: bool = True
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -32,11 +58,37 @@ class Workflow:
         self.description = description
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
+        self.parameter_specs: Dict[str, WorkflowParameterSpec] = {}
+        self.bound_parameters: Dict[str, Any] = {}
+        self.audit_log: List[Dict[str, Any]] = []
         self.status = StepStatus.PENDING
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
         self._step_map[step.id] = step
+        return self
+
+    def define_parameter(
+        self,
+        name: str,
+        default: Any = None,
+        required: bool = False,
+        allow_override: bool = True,
+    ) -> "Workflow":
+        if self.status is not StepStatus.PENDING:
+            raise WorkflowParameterError(
+                "parameter_registration_requires_pending_workflow"
+            )
+        if not name:
+            raise WorkflowParameterError("parameter_name_required")
+        if name in self.parameter_specs:
+            raise WorkflowParameterError("duplicate_workflow_parameter")
+        self.parameter_specs[name] = WorkflowParameterSpec(
+            name=name,
+            default=deepcopy(default),
+            required=required,
+            allow_override=allow_override,
+        )
         return self
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
@@ -61,10 +113,51 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
-    def execute_workflow(self, workflow_id: str) -> bool:
+    def bind_parameters(
+        self,
+        workflow_id: str,
+        overrides: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
+        parameter_keys = sorted(
+            (overrides or {}).keys() | workflow.parameter_specs.keys()
+        )
+        try:
+            workflow.bound_parameters = self._merge_parameters(
+                workflow,
+                overrides or {},
+            )
+        except WorkflowParameterError as exc:
+            self._record_parameter_decision(
+                workflow,
+                decision="rejected",
+                reason=str(exc),
+                parameter_keys=parameter_keys,
+            )
+            return False
+
+        self._record_parameter_decision(
+            workflow,
+            decision="bound",
+            reason="parameters_bound",
+            parameter_keys=parameter_keys,
+        )
+        return True
+
+    def execute_workflow(
+        self,
+        workflow_id: str,
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            return False
+
+        if workflow.parameter_specs or parameters:
+            if not self.bind_parameters(workflow_id, parameters):
+                return False
 
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
@@ -81,6 +174,65 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _merge_parameters(
+        self,
+        workflow: Workflow,
+        overrides: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if workflow.status is not StepStatus.PENDING:
+            raise WorkflowParameterError("workflow_not_pending")
+
+        unknown = sorted(set(overrides) - set(workflow.parameter_specs))
+        if unknown:
+            raise WorkflowParameterError("unknown_workflow_parameter")
+
+        merged: Dict[str, Any] = {}
+        for name, spec in workflow.parameter_specs.items():
+            if name in overrides:
+                if not spec.allow_override:
+                    raise WorkflowParameterError(
+                        "workflow_parameter_override_forbidden"
+                    )
+                value = deepcopy(overrides[name])
+            else:
+                value = deepcopy(spec.default)
+
+            if spec.required and value is None:
+                raise WorkflowParameterError(
+                    "required_workflow_parameter_missing"
+                )
+            merged[name] = value
+
+        return merged
+
+    def _record_parameter_decision(
+        self,
+        workflow: Workflow,
+        decision: str,
+        reason: str,
+        parameter_keys: List[str],
+    ) -> None:
+        record = {
+            "timestamp": time.time(),
+            "workflow_id": workflow.id,
+            "workflow_name": workflow.name,
+            "status": workflow.status.value,
+            "decision": decision,
+            "reason": reason,
+            "parameter_keys": parameter_keys,
+        }
+        workflow.audit_log.append(record)
+        metrics.increment(f"workflow.parameters.{decision}")
+        logger.info(
+            "workflow parameter binding %s for workflow=%s "
+            "status=%s reason=%s keys=%s",
+            decision,
+            workflow.id,
+            workflow.status.value,
+            reason,
+            ",".join(parameter_keys),
+        )
 
 # 2019-03-27T19:58:07 update
 
