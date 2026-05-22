@@ -1,4 +1,4 @@
-import pytest
+from src.common.metrics import MetricsCollector
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -47,6 +47,86 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_rejects_duplicate_plugin_capability_without_state_change(self):
+        metrics = MetricsCollector()
+        registry = AgentRegistry(metrics_collector=metrics)
+
+        agent_id = registry.register("running-agent", "worker.processor")
+        assert registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert registry.register_plugin(
+            "plugin-alpha",
+            ["summarize"],
+            metadata={"private_runtime_payload": "do-not-audit"},
+        )
+        resolution = registry.resolve_capability("summarize")
+        assert resolution["plugin_id"] == "plugin-alpha"
+
+        assert not registry.register_plugin("plugin-beta", ["summarize"])
+
+        resolution = registry.resolve_capability("summarize")
+        assert resolution["plugin_id"] == "plugin-alpha"
+        assert registry.get(agent_id)["status"] == AgentStatus.RUNNING.value
+        assert registry.resolve_capability("missing") is None
+
+        audit = registry.plugin_audit_records[-1]
+        assert audit["accepted"] is False
+        assert audit["reason"] == "duplicate_capability_name"
+        assert "plugin-beta" not in str(audit)
+        assert "summarize" not in str(audit)
+        assert "private_runtime_payload" not in str(audit)
+
+        counters = metrics.snapshot()["counters"]
+        assert counters["registry.plugin_registration.accepted"] == 1
+        assert counters["registry.plugin_registration.rejected"] == 1
+
+    def test_rejects_duplicate_capabilities_within_same_plugin(self):
+        registry = AgentRegistry(metrics_collector=MetricsCollector())
+
+        assert not registry.register_plugin(
+            "plugin-alpha",
+            ["search", "search"],
+        )
+
+        assert registry.resolve_capability("search") is None
+        audit = registry.plugin_audit_records[-1]
+        assert audit["accepted"] is False
+        assert audit["reason"] == "duplicate_capability_in_plugin"
+
+    def test_replacement_invalidates_stale_capability_cache(self):
+        metrics = MetricsCollector()
+        registry = AgentRegistry(metrics_collector=metrics)
+
+        assert registry.register_plugin("plugin-alpha", ["search"])
+        resolution = registry.resolve_capability("search")
+        assert resolution["plugin_id"] == "plugin-alpha"
+
+        assert registry.register_plugin(
+            "plugin-alpha",
+            ["analyze"],
+            replace=True,
+        )
+
+        assert registry.resolve_capability("search") is None
+        resolution = registry.resolve_capability("analyze")
+        assert resolution["plugin_id"] == "plugin-alpha"
+        counters = metrics.snapshot()["counters"]
+        assert counters["registry.capability_cache.invalidated"] == 1
+
+    def test_unregister_plugin_invalidates_capability_resolution(self):
+        metrics = MetricsCollector()
+        registry = AgentRegistry(metrics_collector=metrics)
+
+        assert registry.register_plugin("plugin-alpha", ["search"])
+        resolution = registry.resolve_capability("search")
+        assert resolution["plugin_id"] == "plugin-alpha"
+
+        assert registry.unregister_plugin("plugin-alpha")
+
+        assert registry.resolve_capability("search") is None
+        audit = registry.plugin_audit_records[-1]
+        assert audit["action"] == "unregister"
+        assert audit["accepted"] is True
 
 # 2019-01-23T10:28:57 update
 
