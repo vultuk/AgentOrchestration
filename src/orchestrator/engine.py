@@ -3,9 +3,10 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 from src.agent import AgentRegistry, AgentStatus
+from src.orchestrator.event_intake import EventDecision, EventIntake
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
@@ -15,6 +16,7 @@ class OrchestrationEngine:
     def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
+        self.event_intake = EventIntake()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
@@ -41,6 +43,9 @@ class OrchestrationEngine:
     def stop(self) -> None:
         self._running = False
         logger.info("Orchestration engine stopped")
+
+    def ingest_event(self, event: Dict[str, Any]) -> EventDecision:
+        return self.event_intake.ingest(event)
 
     async def _execute_task(self, task: Dict[str, Any]) -> None:
         task_id = task["id"]
@@ -82,7 +87,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 
