@@ -71,6 +71,36 @@ class TestProtectedRouteAuth:
         assert response.status_code == 401
         assert "location" not in response.headers
 
+    def test_unknown_token_trailing_slash_request_denied_before_redirect(self):
+        client = _client_with_store(_auth_store())
+
+        response = client.get(
+            "/api/v2/agents/",
+            headers={"Authorization": "Bearer token-unknown"},
+        )
+
+        assert response.status_code == 401
+        assert "location" not in response.headers
+
+    def test_blank_bearer_token_denied(self):
+        client = _client_with_store(_auth_store())
+
+        response = client.get(
+            "/api/v2/agents",
+            headers={"Authorization": "Bearer "},
+        )
+
+        assert response.status_code == 401
+
+    def test_stale_browser_session_denied_before_redirect(self):
+        client = _client_with_store(_auth_store())
+        client.cookies.set("ao_session", "token-stale")
+
+        response = client.get("/api/v2/agents/")
+
+        assert response.status_code == 401
+        assert "location" not in response.headers
+
     def test_revoked_token_denied(self):
         client = _client_with_store(_auth_store())
 
@@ -118,6 +148,28 @@ class TestProtectedRouteAuth:
             headers=headers,
         )
         listed = client.get("/api/v2/agents", headers=headers)
+
+        assert created.status_code == 200
+        assert created.json()["status"] == "registered"
+        assert listed.status_code == 200
+        assert any(
+            agent["id"] == created.json()["agent_id"]
+            for agent in listed.json()["agents"]
+        )
+
+    def test_authorized_browser_session_can_write_protected_route(self):
+        client = _client_with_store(_auth_store())
+        client.cookies.set("ao_session", "session-valid")
+
+        created = client.post(
+            "/api/v2/agents",
+            params={"name": "browser-worker", "agent_type": "worker.browser"},
+            headers={"X-Workspace-ID": "default"},
+        )
+        listed = client.get(
+            "/api/v2/agents",
+            headers={"X-Workspace-ID": "default"},
+        )
 
         assert created.status_code == 200
         assert created.json()["status"] == "registered"
