@@ -23,6 +23,9 @@ run:
 docker-build:
 	docker compose -f infra/docker-compose.yml build
 
+docker-validate:
+	uv run python scripts/validate_sidecar_compose.py infra/docker-compose.yml
+
 docker-up:
 	docker compose -f infra/docker-compose.yml up -d
 

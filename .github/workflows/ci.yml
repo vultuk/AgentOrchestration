@@ -23,6 +23,8 @@ jobs:
         uses: astral-sh/setup-uv@v3
       - name: Install dependencies
         run: uv sync
+      - name: Validate sidecar compose hardening
+        run: uv run python scripts/validate_sidecar_compose.py infra/docker-compose.yml
       - name: Run tests
         run: uv run pytest --cov=src tests/
       - name: Lint

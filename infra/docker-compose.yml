@@ -1,0 +1,56 @@
+services:
+  agent-worker:
+    image: python:3.11-slim
+    command: ["python", "-m", "http.server", "8000"]
+
+  metrics-sidecar:
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - "touch /tmp/metrics-ready /var/run/agent/metrics.sock && sleep 3600"
+    depends_on:
+      - agent-worker
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+      - /var/run/agent:rw,noexec,nosuid,size=4m
+    healthcheck:
+      test: ["CMD", "test", "-e", "/tmp/metrics-ready"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      com.agent-orchestration.sidecar: "true"
+      com.agent-orchestration.writable-paths: "/tmp,/var/run/agent"
+
+  log-sidecar:
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - "touch /tmp/log-buffer /var/run/agent/log.sock && sleep 3600"
+    depends_on:
+      - agent-worker
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+      - /var/run/agent:rw,noexec,nosuid,size=4m
+    healthcheck:
+      test: ["CMD", "test", "-e", "/tmp/log-buffer"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      com.agent-orchestration.sidecar: "true"
+      com.agent-orchestration.writable-paths: "/tmp,/var/run/agent"
