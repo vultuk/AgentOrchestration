@@ -12,24 +12,45 @@ from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
 
-_UNKNOWN_RUN_REF = "unknown"
+_UNKNOWN_ENTITY_REF = "unknown"
+_TERMINAL_LIFECYCLES = {"completed", "failed", "cancelled"}
 _EVENT_TRANSITIONS: Dict[str, Tuple[Set[str], str]] = {
     "run.started": ({"pending"}, "running"),
     "run.completed": ({"running"}, "completed"),
     "run.failed": ({"running"}, "failed"),
     "run.cancelled": ({"pending", "running"}, "cancelled"),
+    "task.started": ({"pending"}, "running"),
+    "task.completed": ({"running"}, "completed"),
+    "task.failed": ({"running"}, "failed"),
+    "task.cancelled": ({"pending", "running"}, "cancelled"),
+    "handler.started": ({"pending"}, "running"),
+    "handler.completed": ({"running"}, "completed"),
+    "handler.failed": ({"running"}, "failed"),
+    "handler.cancelled": ({"pending", "running"}, "cancelled"),
+}
+_ENTITY_ID_FIELDS: Dict[str, Tuple[str, ...]] = {
+    "run": ("run_id", "entity_id", "id"),
+    "task": ("task_id", "entity_id", "id"),
+    "handler": ("handler_id", "entity_id", "id"),
+    "unknown": ("entity_id", "run_id", "task_id", "handler_id", "id"),
 }
 
 
 class OrchestrationEngine:
-    def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
+    def __init__(
+        self,
+        max_workers: int = 10,
+        agent_timeout: int = 300,
+        metrics_collector: Optional[MetricsCollector] = None,
+    ):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
-        self.metrics = MetricsCollector()
+        self.metrics = metrics_collector or MetricsCollector()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
-        self._run_events: Dict[str, Dict[str, Any]] = {}
+        self._event_states: Dict[str, Dict[str, Any]] = {}
         self._event_audit: List[Dict[str, Any]] = []
+        self._quarantined_events: List[Dict[str, Any]] = []
         self._running = False
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
@@ -44,140 +65,289 @@ class OrchestrationEngine:
 
     def dispatch_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
         event_type = str(event.get("type") or "")
-        run_id = str(event.get("run_id") or "")
-        attempt = self._integer_event_field(event, "attempt", default=1)
-        revision = self._integer_event_field(event, "revision", default=0)
-        run_state = self._run_events.get(run_id)
+        entity_type = self._event_entity_type(event_type)
+        entity_id = self._event_entity_id(event, entity_type)
+        state_key = self._event_state_key(entity_type, entity_id)
+        attempt = self._event_version(event, "attempt")
+        revision = self._event_version(event, "revision")
+        current_state = self._event_states.get(state_key)
 
-        if not run_id:
-            return self._quarantine_event(
-                event_type,
-                run_id,
-                "missing_run_id",
-                attempt,
-                revision,
-            )
         if event_type not in _EVENT_TRANSITIONS:
             return self._quarantine_event(
                 event_type,
-                run_id,
+                entity_type,
+                entity_id,
                 "unknown_event_type",
                 attempt,
                 revision,
+                current_state,
+            )
+        if not entity_id:
+            return self._quarantine_event(
+                event_type,
+                entity_type,
+                entity_id,
+                self._missing_id_reason(entity_type),
+                attempt,
+                revision,
+                current_state,
+            )
+        if attempt is None or revision is None:
+            return self._quarantine_event(
+                event_type,
+                entity_type,
+                entity_id,
+                "invalid_version_marker",
+                attempt,
+                revision,
+                current_state,
             )
 
-        if run_state:
-            current_attempt = run_state["attempt"]
-            current_revision = run_state["revision"]
+        allowed_sources, target_lifecycle = _EVENT_TRANSITIONS[event_type]
+        requested_lifecycle = event.get("lifecycle")
+        if (
+            requested_lifecycle is not None
+            and str(requested_lifecycle) != target_lifecycle
+        ):
+            return self._quarantine_event(
+                event_type,
+                entity_type,
+                entity_id,
+                "policy_lifecycle_mismatch",
+                attempt,
+                revision,
+                current_state,
+            )
+
+        if current_state:
+            current_attempt = current_state["attempt"]
+            current_revision = current_state["revision"]
+            current_lifecycle = current_state["lifecycle"]
             if attempt < current_attempt:
                 return self._quarantine_event(
                     event_type,
-                    run_id,
+                    entity_type,
+                    entity_id,
                     "stale_attempt",
                     attempt,
                     revision,
+                    current_state,
                 )
-            if attempt == current_attempt and revision <= current_revision:
+            if revision < current_revision:
                 return self._quarantine_event(
                     event_type,
-                    run_id,
+                    entity_type,
+                    entity_id,
                     "stale_revision",
                     attempt,
                     revision,
+                    current_state,
+                )
+            if attempt == current_attempt and revision == current_revision:
+                reason = (
+                    "duplicate_transition"
+                    if current_lifecycle == target_lifecycle
+                    else "stale_revision"
+                )
+                return self._quarantine_event(
+                    event_type,
+                    entity_type,
+                    entity_id,
+                    reason,
+                    attempt,
+                    revision,
+                    current_state,
+                )
+            if current_lifecycle in _TERMINAL_LIFECYCLES:
+                return self._quarantine_event(
+                    event_type,
+                    entity_type,
+                    entity_id,
+                    "terminal_lifecycle",
+                    attempt,
+                    revision,
+                    current_state,
+                )
+            if current_lifecycle == target_lifecycle:
+                return self._quarantine_event(
+                    event_type,
+                    entity_type,
+                    entity_id,
+                    "duplicate_transition",
+                    attempt,
+                    revision,
+                    current_state,
                 )
 
-        allowed_sources, target_lifecycle = _EVENT_TRANSITIONS[event_type]
-        current_lifecycle = run_state["lifecycle"] if run_state else "pending"
+        current_lifecycle = (
+            current_state["lifecycle"] if current_state else "pending"
+        )
         if current_lifecycle not in allowed_sources:
             return self._quarantine_event(
                 event_type,
-                run_id,
+                entity_type,
+                entity_id,
                 "invalid_lifecycle",
                 attempt,
                 revision,
+                current_state,
             )
 
         next_state = {
+            "entity_type": entity_type,
             "lifecycle": target_lifecycle,
             "attempt": attempt,
             "revision": revision,
             "event_type": event_type,
         }
-        self._run_events[run_id] = next_state
+        self._event_states[state_key] = next_state
         return self._record_event_decision(
             "accepted",
             event_type,
-            run_id,
+            entity_type,
+            entity_id,
             "",
             attempt,
             revision,
+            current_state,
         )
 
     def get_run_event_state(self, run_id: str) -> Optional[Dict[str, Any]]:
-        state = self._run_events.get(run_id)
-        return dict(state) if state else None
+        return self.get_event_state(run_id, "run")
+
+    def get_event_state(
+        self,
+        entity_id: str,
+        entity_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if entity_type:
+            state = self._event_states.get(
+                self._event_state_key(entity_type, entity_id)
+            )
+            return dict(state) if state else None
+
+        for family in ("run", "task", "handler"):
+            state = self._event_states.get(
+                self._event_state_key(family, entity_id)
+            )
+            if state:
+                return dict(state)
+        return None
+
+    def quarantined_events(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._quarantined_events]
 
     def event_audit_records(self) -> List[Dict[str, Any]]:
         return [dict(record) for record in self._event_audit]
 
-    def _integer_event_field(
+    def _event_entity_type(self, event_type: str) -> str:
+        family = event_type.split(".", 1)[0] if "." in event_type else ""
+        if family in _ENTITY_ID_FIELDS:
+            return family
+        return "unknown"
+
+    def _event_entity_id(self, event: Dict[str, Any], entity_type: str) -> str:
+        for field in _ENTITY_ID_FIELDS.get(entity_type, ()):
+            value = event.get(field)
+            if value:
+                return str(value)
+        return ""
+
+    def _event_state_key(self, entity_type: str, entity_id: str) -> str:
+        return f"{entity_type}:{entity_id}"
+
+    def _missing_id_reason(self, entity_type: str) -> str:
+        if entity_type == "run":
+            return "missing_run_id"
+        if entity_type in {"task", "handler"}:
+            return f"missing_{entity_type}_id"
+        return "missing_entity_id"
+
+    def _event_version(
         self,
         event: Dict[str, Any],
         field: str,
-        default: int,
-    ) -> int:
+    ) -> Optional[int]:
+        if field not in event:
+            return None
         try:
-            return int(event.get(field, default))
+            value = int(event[field])
         except (TypeError, ValueError):
-            return default
+            return None
+        return value if value >= 0 else None
 
-    def _run_ref(self, run_id: str) -> str:
-        if not run_id:
-            return _UNKNOWN_RUN_REF
-        return hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:12]
+    def _entity_ref(self, entity_id: str) -> str:
+        if not entity_id:
+            return _UNKNOWN_ENTITY_REF
+        return hashlib.sha256(entity_id.encode("utf-8")).hexdigest()[:12]
 
     def _quarantine_event(
         self,
         event_type: str,
-        run_id: str,
+        entity_type: str,
+        entity_id: str,
         reason: str,
-        attempt: int,
-        revision: int,
+        attempt: Optional[int],
+        revision: Optional[int],
+        current_state: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        return self._record_event_decision(
+        record = self._record_event_decision(
             "quarantined",
             event_type,
-            run_id,
+            entity_type,
+            entity_id,
             reason,
             attempt,
             revision,
+            current_state,
         )
+        self._quarantined_events.append(record)
+        return record
 
     def _record_event_decision(
         self,
         decision: str,
         event_type: str,
-        run_id: str,
+        entity_type: str,
+        entity_id: str,
         reason: str,
-        attempt: int,
-        revision: int,
+        attempt: Optional[int],
+        revision: Optional[int],
+        current_state: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        current_lifecycle = (
+            current_state["lifecycle"] if current_state else None
+        )
+        target_lifecycle = _EVENT_TRANSITIONS.get(
+            event_type,
+            (set(), "unknown"),
+        )[1]
         record = {
             "decision": decision,
             "event_type": event_type or "missing",
+            "entity_type": entity_type,
             "reason": reason,
-            "run_ref": self._run_ref(run_id),
+            "entity_ref": self._entity_ref(entity_id),
             "attempt": attempt,
             "revision": revision,
+            "current_lifecycle": current_lifecycle,
+            "target_lifecycle": target_lifecycle,
         }
+        if entity_type == "run":
+            record["run_ref"] = record["entity_ref"]
         self._event_audit.append(record)
         self.metrics.increment(f"orchestrator.events.{decision}")
+        self.metrics.increment(f"orchestrator.events.{entity_type}.{decision}")
+        if decision == "quarantined":
+            self.metrics.increment(f"orchestrator.events.quarantined.{reason}")
         logger.info(
-            "orchestrator event decision=%s type=%s reason=%s run_ref=%s",
+            "orchestrator event decision=%s type=%s reason=%s "
+            "entity_type=%s entity_ref=%s",
             decision,
             record["event_type"],
             reason or "none",
-            record["run_ref"],
+            entity_type,
+            record["entity_ref"],
         )
         return dict(record)
 
