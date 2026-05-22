@@ -1,10 +1,22 @@
 """Orchestration engine module."""
 
 from .engine import OrchestrationEngine
+from .retention import (
+    RetentionException,
+    RetentionExceptionRegistry,
+    RetentionExceptionValidationError,
+)
 from .scheduler import TaskScheduler
 from .workflow import WorkflowManager
 
-__all__ = ["OrchestrationEngine", "TaskScheduler", "WorkflowManager"]
+__all__ = [
+    "OrchestrationEngine",
+    "RetentionException",
+    "RetentionExceptionRegistry",
+    "RetentionExceptionValidationError",
+    "TaskScheduler",
+    "WorkflowManager",
+]
 
 # 2019-07-01T16:04:27 update
 
