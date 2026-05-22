@@ -20,8 +20,8 @@ async def list_agents(
 
 @router.post("/agents")
 async def register_agent(
-    name: str,
-    agent_type: str,
+    name: Optional[str] = None,
+    agent_type: Optional[str] = None,
     config: Optional[Dict] = None,
 ):
     return agent_service.register_agent(registry, name, agent_type, config)

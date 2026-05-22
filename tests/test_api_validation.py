@@ -11,6 +11,7 @@ class RecordingRegistry:
         self.get_calls = []
         self.delete_calls = []
         self.update_status_calls = []
+        self.register_calls = []
         self.count_calls = 0
 
     def list(self, status=None, group=None):
@@ -20,6 +21,12 @@ class RecordingRegistry:
     def get(self, agent_id):
         self.get_calls.append(agent_id)
         return None
+
+    def register(self, name, agent_type, config=None):
+        self.register_calls.append(
+            {"name": name, "agent_type": agent_type, "config": config},
+        )
+        return "agent-id"
 
     def delete(self, agent_id):
         self.delete_calls.append(agent_id)
@@ -78,7 +85,21 @@ def test_malformed_agents_status_returns_400_before_lookup(monkeypatch):
     )
 
     assert response.status_code == 400
-    assert response.json() == {"detail": "Invalid agent status: started"}
+    assert response.json() == {
+        "detail": {
+            "code": "validation_error",
+            "field": "status",
+            "message": "status must be a known agent status",
+            "allowed": [
+                "pending",
+                "running",
+                "paused",
+                "stopped",
+                "failed",
+                "terminated",
+            ],
+        },
+    }
     assert registry.list_calls == []
 
 
@@ -91,7 +112,13 @@ def test_malformed_agent_id_returns_400_before_lookup(monkeypatch):
     )
 
     assert response.status_code == 400
-    assert response.json() == {"detail": "Invalid agent_id"}
+    assert response.json() == {
+        "detail": {
+            "code": "validation_error",
+            "field": "agent_id",
+            "message": "agent_id must be a valid UUID",
+        },
+    }
     assert registry.get_calls == []
 
 
@@ -104,9 +131,53 @@ def test_malformed_agent_id_returns_400_before_mutation(monkeypatch):
     )
 
     assert response.status_code == 400
-    assert response.json() == {"detail": "Invalid agent_id"}
+    assert response.json() == {
+        "detail": {
+            "code": "validation_error",
+            "field": "agent_id",
+            "message": "agent_id must be a valid UUID",
+        },
+    }
     assert registry.delete_calls == []
     assert registry.update_status_calls == []
+
+
+def test_malformed_agent_id_returns_400_before_status_mutation(monkeypatch):
+    client, registry = client_with_registry(monkeypatch)
+
+    response = client.post(
+        "/api/v2/agents/not-a-uuid/start",
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": {
+            "code": "validation_error",
+            "field": "agent_id",
+            "message": "agent_id must be a valid UUID",
+        },
+    }
+    assert registry.update_status_calls == []
+
+
+def test_blank_registration_returns_400_before_mutation(monkeypatch):
+    client, registry = client_with_registry(monkeypatch)
+
+    response = client.post(
+        "/api/v2/agents?name=  &agent_type=worker",
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": {
+            "code": "validation_error",
+            "field": "name",
+            "message": "name is required",
+        },
+    }
+    assert registry.register_calls == []
 
 
 def test_static_count_route_is_not_treated_as_malformed_agent_id(monkeypatch):

@@ -8,15 +8,36 @@ from fastapi import HTTPException
 from src.agent import AgentRegistry, AgentStatus
 
 
+def validation_error(
+    field: str,
+    message: str,
+    **extra: object,
+) -> HTTPException:
+    detail = {
+        "code": "validation_error",
+        "field": field,
+        "message": message,
+    }
+    detail.update(extra)
+    return HTTPException(status_code=400, detail=detail)
+
+
+def require_text(value: Optional[str], field: str) -> str:
+    if value is None or not value.strip():
+        raise validation_error(field, f"{field} is required")
+    return value.strip()
+
+
 def parse_agent_status(status: Optional[str]) -> Optional[AgentStatus]:
     if not status:
         return None
     try:
         return AgentStatus(status)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid agent status: {status}",
+        raise validation_error(
+            "status",
+            "status must be a known agent status",
+            allowed=[item.value for item in AgentStatus],
         ) from exc
 
 
@@ -24,9 +45,9 @@ def parse_agent_id(agent_id: str) -> str:
     try:
         return str(UUID(agent_id))
     except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid agent_id",
+        raise validation_error(
+            "agent_id",
+            "agent_id must be a valid UUID",
         ) from exc
 
 
@@ -41,11 +62,13 @@ def list_agents(
 
 def register_agent(
     registry: AgentRegistry,
-    name: str,
-    agent_type: str,
+    name: Optional[str],
+    agent_type: Optional[str],
     config: Optional[Dict] = None,
 ) -> Dict:
-    agent_id = registry.register(name, agent_type, config)
+    valid_name = require_text(name, "name")
+    valid_agent_type = require_text(agent_type, "agent_type")
+    agent_id = registry.register(valid_name, valid_agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
 
